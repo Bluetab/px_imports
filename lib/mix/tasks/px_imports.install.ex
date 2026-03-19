@@ -31,6 +31,9 @@ if Code.ensure_loaded?(Igniter) do
       * `--projects` — generates `<App>.Projects.Project` Ash resource plus
         `SyncProjectsWorker` (daily at 02:30)
 
+      * `--spend-types` — generates `<App>.Projects.SpendType` Ash resource
+        plus `SyncSpendTypesWorker` (daily at 02:45)
+
       * `--users` — patches `Accounts.User` with employee fields (`sap_id`,
         `join_date`, `hidden_at`) and a `:sync_employee_fields` update action,
         plus `SyncEmployeesWorker` (daily at 02:00)
@@ -39,6 +42,7 @@ if Code.ensure_loaded?(Igniter) do
 
         mix px_imports.install --org_tree
         mix px_imports.install --users --projects
+        mix px_imports.install --spend-types
         mix px_imports.install --org_tree --users --projects
     """
 
@@ -52,7 +56,8 @@ if Code.ensure_loaded?(Igniter) do
         schema: [
           users: :boolean,
           projects: :boolean,
-          org_tree: :boolean
+          org_tree: :boolean,
+          spend_types: :boolean
         ]
       }
     end
@@ -63,14 +68,16 @@ if Code.ensure_loaded?(Igniter) do
       install_org_tree? = Keyword.get(opts, :org_tree, false)
       install_users? = Keyword.get(opts, :users, false)
       install_projects? = Keyword.get(opts, :projects, false)
+      install_spend_types? = Keyword.get(opts, :spend_types, false)
 
-      if not (install_org_tree? or install_users? or install_projects?) do
+      if not (install_org_tree? or install_users? or install_projects? or install_spend_types?) do
         Igniter.add_issue(igniter, """
-        At least one of --org_tree, --users, or --projects must be specified.
+        At least one of --org_tree, --users, --projects, or --spend-types must be specified.
 
         Examples:
           mix px_imports.install --org_tree
           mix px_imports.install --users --projects
+          mix px_imports.install --spend-types
           mix px_imports.install --org_tree --users --projects
         """)
       else
@@ -95,6 +102,7 @@ if Code.ensure_loaded?(Igniter) do
         sync_org_tree_worker_module = Module.concat([prefix, Workers, SyncOrgTreeWorker])
         sync_employees_worker_module = Module.concat([prefix, Workers, SyncEmployeesWorker])
         sync_projects_worker_module = Module.concat([prefix, Workers, SyncProjectsWorker])
+        sync_spend_types_worker_module = Module.concat([prefix, Workers, SyncSpendTypesWorker])
 
         cron_entries =
           []
@@ -113,6 +121,11 @@ if Code.ensure_loaded?(Igniter) do
               do: e ++ [{"0 3 * * *", sync_org_tree_worker_module}],
               else: e
           end)
+          |> then(fn e ->
+            if install_spend_types?,
+              do: e ++ [{"45 2 * * *", sync_spend_types_worker_module}],
+              else: e
+          end)
 
         org_tree_resources =
           if install_org_tree? do
@@ -128,14 +141,24 @@ if Code.ensure_loaded?(Igniter) do
           end
 
         project_resources =
-          if install_projects?,
-            do: [Module.concat([prefix, Projects, Project])],
-            else: []
+          []
+          |> then(fn resources ->
+            if install_projects?,
+              do: resources ++ [Module.concat([prefix, Projects, Project])],
+              else: resources
+          end)
+          |> then(fn resources ->
+            if install_spend_types?,
+              do: resources ++ [Module.concat([prefix, Projects, SpendType])],
+              else: resources
+          end)
 
         all_project_resources = org_tree_resources ++ project_resources
 
         domains_to_add =
-          if install_org_tree? or install_projects?, do: [projects_domain_module], else: []
+          if install_org_tree? or install_projects? or install_spend_types?,
+            do: [projects_domain_module],
+            else: []
 
         igniter
         |> check_oban_present()
@@ -226,6 +249,33 @@ if Code.ensure_loaded?(Igniter) do
             ign
           end
         end)
+        |> then(fn ign ->
+          if install_spend_types? do
+            spend_type_module = Module.concat([prefix, Projects, SpendType])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_projects? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, spend_type_module)
+            |> create_spend_type_resource(
+              spend_type_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_spend_types_worker(
+              sync_spend_types_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
         |> Igniter.add_notice("""
         PxImports has been configured!
 
@@ -247,6 +297,10 @@ if Code.ensure_loaded?(Igniter) do
         4. The Oban dev dashboard is available at /oban (dev mode only).
 
         5. The jobs admin page is at /admin/jobs.
+
+        6. To install spend type sync only:
+
+             mix px_imports.install --spend-types
         """)
       end
     end
@@ -326,7 +380,7 @@ if Code.ensure_loaded?(Igniter) do
               String.contains?(content, "#{otp_app_str}, Oban") and
                   String.contains?(content, "Oban.Plugins.Cron") ->
                 Regex.replace(
-                  ~r/\{Oban\.Plugins\.Cron,[^}]*\}/s,
+                  ~r/\{Oban\.Plugins\.Cron,\s*crontab:\s*\[.*?\]\s*\}/s,
                   content,
                   new_cron_plugin,
                   global: false
@@ -1255,6 +1309,35 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    # Patches an existing domain module to include a resource declaration
+    # if it isn't already present. Safe to call whether the domain was just
+    # created in this run or existed from a previous install.
+    defp ensure_resource_in_domain(igniter, domain_module, resource_module) do
+      resource_str = inspect(resource_module)
+
+      Igniter.Project.Module.find_and_update_module!(igniter, domain_module, fn zipper ->
+        source = Sourceror.Zipper.root(zipper) |> Sourceror.to_string()
+
+        if String.contains?(source, resource_str) do
+          {:ok, zipper}
+        else
+          resource_line = "    resource #{resource_str}"
+
+          new_source =
+            Regex.replace(
+              ~r/(resources\s+do\n)(.*?)(^\s*end)/ms,
+              source,
+              fn _, opener, existing, closer ->
+                opener <> existing <> resource_line <> "\n" <> closer
+              end,
+              global: false
+            )
+
+          {:ok, Sourceror.parse_string!(new_source) |> Sourceror.Zipper.zip()}
+        end
+      end)
+    end
+
     defp create_business_unit(igniter, module, domain_module, repo_module) do
       {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
 
@@ -2127,7 +2210,6 @@ if Code.ensure_loaded?(Igniter) do
         igniter
       else
         repo_module = Module.concat(prefix, Repo)
-        accounts_module = Module.concat(prefix, Accounts)
 
         contents = """
         @moduledoc \"\"\"
@@ -2141,7 +2223,6 @@ if Code.ensure_loaded?(Igniter) do
 
         import Ecto.Query
 
-        alias #{inspect(accounts_module)}
         alias #{inspect(user_module)}
         alias #{inspect(repo_module)}
 
@@ -2286,6 +2367,349 @@ if Code.ensure_loaded?(Igniter) do
         defp hidden_at_changed?(%DateTime{} = current, %DateTime{} = desired) do
           DateTime.compare(current, desired) != :eq
         end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
+    # Spend types: SpendType resource + SyncSpendTypesWorker
+    # ──────────────────────────────────────────────
+
+    defp create_spend_type_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "spend_types"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+            accept [:id, :name, :sap_id, :sap_name, :custom_fields, :hidden_at]
+          end
+
+          update :sync_from_px do
+            accept [:name, :sap_id, :sap_name, :custom_fields, :hidden_at]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          attribute :id, :integer do
+            primary_key? true
+            allow_nil? false
+            public? true
+          end
+
+          attribute :name, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :sap_id, :string do
+            public? true
+          end
+
+          attribute :sap_name, :string do
+            public? true
+          end
+
+          attribute :custom_fields, :map do
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_spend_types_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        spend_type_module = Module.concat(domain_module, SpendType)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes PX spend types into the local Projects.SpendType resource.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(spend_type_module)}
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs the provided spend types payload into the local spend_types table.
+        \"\"\"
+        def execute(spend_types) when is_list(spend_types) do
+          sync_spend_types(spend_types)
+        end
+
+        defp run_sync do
+          case BluetabConnect.Px.Rest.list_spend_types() do
+            {:ok, spend_types} when is_list(spend_types) ->
+              {:ok, execute(spend_types)}
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp sync_spend_types(spend_types) do
+          existing_spend_types = Ash.read!(SpendType, domain: Projects, authorize?: false)
+          existing_by_id = Map.new(existing_spend_types, &{&1.id, &1})
+
+          result =
+            Enum.reduce(
+              spend_types,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_spend_type, acc ->
+                attrs = extract_spend_type_attrs(raw_spend_type)
+                spend_type_id = Map.get(attrs, :id)
+                name = Map.get(attrs, :name)
+
+                case Map.get(existing_by_id, spend_type_id) do
+                  nil ->
+                    case Ash.create(SpendType, attrs,
+                           action: :create,
+                           domain: Projects,
+                           authorize?: false
+                         ) do
+                      {:ok, _created} ->
+                        %{acc | created: [%{id: spend_type_id, name: name} | acc.created]}
+
+                      {:error, error} ->
+                        %{
+                          acc
+                          | failed: [
+                              %{id: spend_type_id, name: name, error: inspect(error)}
+                              | acc.failed
+                            ]
+                        }
+                    end
+
+                  existing ->
+                    changes = build_changes(existing, attrs)
+
+                    if map_size(changes) == 0 do
+                      %{acc | skipped: [%{id: spend_type_id, name: name} | acc.skipped]}
+                    else
+                      case existing
+                           |> Ash.Changeset.for_update(:sync_from_px, changes)
+                           |> Ash.update(authorize?: false) do
+                        {:ok, _updated} ->
+                          %{
+                            acc
+                            | updated: [
+                                %{id: spend_type_id, name: name, changes: presentable_changes(changes)}
+                                | acc.updated
+                              ]
+                          }
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                %{id: spend_type_id, name: name, error: inspect(error)}
+                                | acc.failed
+                              ]
+                          }
+                      end
+                    end
+                end
+              end
+            )
+
+          incoming_ids =
+            spend_types
+            |> Enum.map(&extract_spend_type_attrs/1)
+            |> Enum.map(&Map.get(&1, :id))
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_spend_types, incoming_ids, result)
+
+          %{
+            total: length(spend_types),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp extract_spend_type_attrs(raw) do
+          %{
+            id: parse_integer(raw["id"]),
+            name: normalize_string(raw["name"]),
+            sap_id: normalize_string(raw["sap_id"]),
+            sap_name: normalize_string(raw["sap_name"]),
+            custom_fields: normalize_custom_fields(raw["custom_fields"])
+          }
+          |> drop_nil_values()
+        end
+
+        defp build_changes(existing, attrs) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([:id])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp soft_hide_missing(existing_spend_types, incoming_ids, result) do
+          Enum.reduce(existing_spend_types, result, fn spend_type, acc ->
+            cond do
+              MapSet.member?(incoming_ids, spend_type.id) ->
+                acc
+
+              not is_nil(spend_type.hidden_at) ->
+                acc
+
+              true ->
+                case spend_type
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [%{id: spend_type.id, name: spend_type.name} | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [%{id: spend_type.id, name: spend_type.name, error: inspect(error)} | acc.failed]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp empty_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp normalize_custom_fields(nil), do: %{"fields" => []}
+        defp normalize_custom_fields(value) when is_map(value), do: value
+        defp normalize_custom_fields(value) when is_list(value), do: %{"fields" => value}
+        defp normalize_custom_fields(_), do: %{"fields" => []}
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(value), do: inspect(value)
+
+        defp parse_integer(nil), do: nil
+        defp parse_integer(value) when is_integer(value), do: value
+
+        defp parse_integer(value) when is_binary(value) do
+          case Integer.parse(value) do
+            {number, ""} -> number
+            _ -> nil
+          end
+        end
+
+        defp parse_integer(_), do: nil
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
         """
 
         Igniter.Project.Module.create_module(igniter, module, contents)
