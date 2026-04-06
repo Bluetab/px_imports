@@ -16,11 +16,16 @@ defmodule PxImports do
     * `--projects` — generates an Ash `Project` resource under the `Projects`
       domain, plus a `SyncProjectsWorker` Oban job.
 
-    * `--users` — patches the existing `Accounts.User` resource with employee
-      fields (`sap_id`, `join_date`, `hidden_at`) and a `:sync_employee_fields`
-      update action, plus a `SyncEmployeesWorker` Oban job.
+    * `--users` — patches the existing `Accounts.User` resource with PX
+      employee fields (`sap_id`, `join_date`, `hidden_at`, `ssff_id`,
+      `manager_employee_number`, `category`, `category_name`, `weekly_hours`,
+      `is_active`, `full_name`, `first_name`, `last_name`), a
+      `:sync_employee_fields` update action (syncs all but the name fields;
+      match by `email` without overwriting it), plus a `SyncEmployeesWorker`
+      Oban job. Re-running on an already-patched app may skip changes; merge
+      manually if needed.
 
-  At least one flag must be provided. All three may be combined.
+  At least one flag must be provided. All flags may be combined.
 
   ## What is always generated
 

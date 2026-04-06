@@ -34,9 +34,20 @@ if Code.ensure_loaded?(Igniter) do
       * `--spend-types` — generates `<App>.Projects.SpendType` Ash resource
         plus `SyncSpendTypesWorker` (daily at 02:45)
 
-      * `--users` — patches `Accounts.User` with employee fields (`sap_id`,
-        `join_date`, `hidden_at`) and a `:sync_employee_fields` update action,
-        plus `SyncEmployeesWorker` (daily at 02:00)
+      * `--users` — patches `Accounts.User` with PX employee fields: `sap_id`,
+        `join_date`, `hidden_at`, `ssff_id`, `manager_employee_number`,
+        `category`, `category_name`, `weekly_hours`, `is_active`, and
+        `full_name`, `first_name`, `last_name`. The `:sync_employee_fields`
+        action updates synced fields from the PX API; `full_name`, `first_name`,
+        and `last_name` are not accepted there (populate elsewhere). Users are
+        matched by `email`, which is never overwritten by the sync job.
+        `SyncEmployeesWorker` runs daily at 02:00.
+
+        If this installer was already run with `--users`, Ash Igniter skips
+        attributes and actions that already exist and does not overwrite an
+        existing `SyncEmployeesWorker` module. Add new columns and merge
+        `:sync_employee_fields` and the worker by hand, or remove the worker
+        module and re-run to regenerate it.
 
     ## Usage
 
@@ -2192,12 +2203,67 @@ if Code.ensure_loaded?(Igniter) do
         :hidden_at,
         "attribute :hidden_at, :utc_datetime"
       )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :ssff_id,
+        "attribute :ssff_id, :string"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :manager_employee_number,
+        "attribute :manager_employee_number, :integer"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :category,
+        "attribute :category, :string"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :category_name,
+        "attribute :category_name, :string"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :weekly_hours,
+        "attribute :weekly_hours, :integer"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :is_active,
+        "attribute :is_active, :boolean"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :full_name,
+        "attribute :full_name, :string"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :first_name,
+        "attribute :first_name, :string"
+      )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :last_name,
+        "attribute :last_name, :string"
+      )
       |> Ash.Resource.Igniter.add_new_action(
         user_module,
         :sync_employee_fields,
         """
         update :sync_employee_fields do
-          accept [:join_date, :hidden_at, :sap_id]
+          accept [
+            :join_date,
+            :hidden_at,
+            :sap_id,
+            :ssff_id,
+            :manager_employee_number,
+            :category,
+            :category_name,
+            :weekly_hours,
+            :is_active
+          ]
         end
         """
       )
@@ -2215,8 +2281,13 @@ if Code.ensure_loaded?(Igniter) do
         @moduledoc \"\"\"
         Synchronizes PX employee data into Accounts.User records.
 
-        Matches employees to existing users by email address and updates
-        employee fields (sap_id, join_date, hidden_at from termination_date).
+        Matches employees to existing users by email (never overwrites email).
+        Updates: `sap_id` from `sap_employee_number`, `join_date` from
+        `start_date` (only when join_date was nil), `hidden_at` from
+        `termination_date`, and `ssff_id`, `manager_employee_number`, `category`,
+        `category_name`, `weekly_hours`, and `is_active` when they differ from PX.
+
+        Does not sync `full_name`, `first_name`, or `last_name`.
         \"\"\"
 
         use Oban.Worker, queue: :default, max_attempts: 3
@@ -2308,6 +2379,12 @@ if Code.ensure_loaded?(Igniter) do
           |> maybe_put_join_date(user, employee)
           |> maybe_put_hidden_at(user, employee)
           |> maybe_put_sap_id(user, employee)
+          |> maybe_put_ssff_id(user, employee)
+          |> maybe_put_manager_employee_number(user, employee)
+          |> maybe_put_category(user, employee)
+          |> maybe_put_category_name(user, employee)
+          |> maybe_put_weekly_hours(user, employee)
+          |> maybe_put_is_active(user, employee)
         end
 
         defp maybe_put_join_date(attrs, user, employee) do
@@ -2339,6 +2416,103 @@ if Code.ensure_loaded?(Igniter) do
             true -> attrs
           end
         end
+
+        defp maybe_put_ssff_id(attrs, user, employee) do
+          desired = normalize_string_field(employee["ssff_id"])
+
+          if normalize_string_field(user.ssff_id) != desired do
+            Map.put(attrs, :ssff_id, desired)
+          else
+            attrs
+          end
+        end
+
+        defp maybe_put_manager_employee_number(attrs, user, employee) do
+          n = parse_sap_id(employee["manager_employee_number"])
+
+          if user.manager_employee_number != n do
+            Map.put(attrs, :manager_employee_number, n)
+          else
+            attrs
+          end
+        end
+
+        defp maybe_put_category(attrs, user, employee) do
+          desired = normalize_string_field(employee["category"])
+
+          if normalize_string_field(user.category) != desired do
+            Map.put(attrs, :category, desired)
+          else
+            attrs
+          end
+        end
+
+        defp maybe_put_category_name(attrs, user, employee) do
+          desired = normalize_string_field(employee["category_name"])
+
+          if normalize_string_field(user.category_name) != desired do
+            Map.put(attrs, :category_name, desired)
+          else
+            attrs
+          end
+        end
+
+        defp maybe_put_weekly_hours(attrs, user, employee) do
+          n = parse_weekly_hours(employee["weekly_hours"])
+
+          if user.weekly_hours != n do
+            Map.put(attrs, :weekly_hours, n)
+          else
+            attrs
+          end
+        end
+
+        defp maybe_put_is_active(attrs, user, employee) do
+          n = parse_boolean(employee["is_active"])
+
+          if user.is_active != n do
+            Map.put(attrs, :is_active, n)
+          else
+            attrs
+          end
+        end
+
+        defp normalize_string_field(nil), do: nil
+
+        defp normalize_string_field(s) when is_binary(s) do
+          case String.trim(s) do
+            "" -> nil
+            t -> t
+          end
+        end
+
+        defp normalize_string_field(_), do: nil
+
+        defp parse_weekly_hours(nil), do: nil
+        defp parse_weekly_hours(n) when is_integer(n), do: n
+        defp parse_weekly_hours(n) when is_float(n), do: round(n)
+
+        defp parse_weekly_hours(s) when is_binary(s) do
+          case Integer.parse(s) do
+            {i, ""} ->
+              i
+
+            _ ->
+              case Float.parse(s) do
+                {f, ""} -> round(f)
+                _ -> nil
+              end
+          end
+        end
+
+        defp parse_weekly_hours(_), do: nil
+
+        defp parse_boolean(nil), do: nil
+        defp parse_boolean(true), do: true
+        defp parse_boolean(false), do: false
+        defp parse_boolean("true"), do: true
+        defp parse_boolean("false"), do: false
+        defp parse_boolean(_), do: nil
 
         defp parse_termination_date(nil), do: nil
 
