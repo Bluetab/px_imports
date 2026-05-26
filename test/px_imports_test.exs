@@ -1,8 +1,7 @@
 defmodule PxImportsTest do
   use ExUnit.Case
-  doctest PxImports
 
-  test "greets the world" do
-    assert PxImports.hello() == :world
+  test "PxImports module loads" do
+    assert Code.ensure_loaded?(PxImports)
   end
 end

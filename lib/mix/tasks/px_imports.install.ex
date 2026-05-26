@@ -24,12 +24,10 @@ if Code.ensure_loaded?(Igniter) do
 
     At least one must be provided:
 
-      * `--org_tree` — generates five Ash resources under `<App>.Projects`
-        (BusinessUnit, Cluster, ClientGroup, Client, Initiative) plus
-        `SyncOrgTreeWorker` (daily at 03:00)
-
-      * `--projects` — generates `<App>.Projects.Project` Ash resource plus
-        `SyncProjectsWorker` (daily at 02:30)
+      * `--org-tree` — generates Ash resources under `<App>.Projects`
+        (BusinessUnit, Cluster, ClientGroup, Client, Project) plus
+        `SyncProjectsWorker` (module only; invoked from org-tree sync) and
+        `SyncOrgTreeWorker` (daily at 03:00). Projects attach to a client and/or cluster.
 
       * `--spend-types` — generates `<App>.Projects.SpendType` Ash resource
         plus `SyncSpendTypesWorker` (daily at 02:45)
@@ -37,28 +35,29 @@ if Code.ensure_loaded?(Igniter) do
       * `--month_close` — generates `<App>.Projects.MonthEndClose` Ash resource
         plus `SyncMonthEndCloseWorker` (daily at 02:50)
 
-      * `--users` — patches `Accounts.User` with PX employee fields: `sap_id`,
-        `join_date`, `hidden_at`, `ssff_id`, `manager_employee_number`,
-        `category`, `category_name`, `weekly_hours`, `is_active`, and
-        `full_name`, `first_name`, `last_name`. The `:sync_employee_fields`
-        action updates synced fields from the PX API; `full_name`, `first_name`,
-        and `last_name` are not accepted there (populate elsewhere). Users are
-        matched by `email`, which is never overwritten by the sync job.
-        `SyncEmployeesWorker` runs daily at 02:00.
+      * `--positions` — generates `<App>.Projects.Position` and
+        `<App>.Projects.PositionRelationship` Ash resources plus
+        `SyncPositionsWorker` (daily at 02:55)
+
+      * `--users` — patches `Accounts.User` with PX employee fields (see generated
+        resource), `:provision_from_employee_sync`, `:sync_employee_fields`, and
+        `SyncEmployeesWorker` (daily at 02:00). Sync creates users when an employee
+        email is not yet present. Stores PX `category` and `category_name` as strings
+        only (no separate Catalog domain).
 
         If this installer was already run with `--users`, Ash Igniter skips
         attributes and actions that already exist and does not overwrite an
-        existing `SyncEmployeesWorker` module. Add new columns and merge
-        `:sync_employee_fields` and the worker by hand, or remove the worker
-        module and re-run to regenerate it.
+        existing `SyncEmployeesWorker` module. Add new columns and merge by hand,
+        or remove the worker module and re-run to regenerate it.
 
     ## Usage
 
-        mix px_imports.install --org_tree
-        mix px_imports.install --users --projects
+        mix px_imports.install --org-tree
+        mix px_imports.install --users
         mix px_imports.install --spend-types
         mix px_imports.install --month_close
-        mix px_imports.install --org_tree --users --projects
+        mix px_imports.install --positions
+        mix px_imports.install --org-tree --users
     """
 
     use Igniter.Mix.Task
@@ -67,13 +66,13 @@ if Code.ensure_loaded?(Igniter) do
     def info(_argv, _composing_task) do
       %Igniter.Mix.Task.Info{
         group: :px_imports,
-        example: "mix px_imports.install --org_tree --users",
+        example: "mix px_imports.install --org-tree --users",
         schema: [
           users: :boolean,
-          projects: :boolean,
           org_tree: :boolean,
           spend_types: :boolean,
-          month_close: :boolean
+          month_close: :boolean,
+          positions: :boolean
         ]
       }
     end
@@ -83,21 +82,22 @@ if Code.ensure_loaded?(Igniter) do
       opts = igniter.args.options
       install_org_tree? = Keyword.get(opts, :org_tree, false)
       install_users? = Keyword.get(opts, :users, false)
-      install_projects? = Keyword.get(opts, :projects, false)
       install_spend_types? = Keyword.get(opts, :spend_types, false)
       install_month_close? = Keyword.get(opts, :month_close, false)
+      install_positions? = Keyword.get(opts, :positions, false)
 
-      if not (install_org_tree? or install_users? or install_projects? or install_spend_types? or
-                install_month_close?) do
+      if not (install_org_tree? or install_users? or install_spend_types? or install_month_close? or
+                install_positions?) do
         Igniter.add_issue(igniter, """
-        At least one of --org_tree, --users, --projects, --spend-types, or --month_close must be specified.
+        At least one of --org-tree, --users, --spend-types, --month_close, or --positions must be specified.
 
         Examples:
-          mix px_imports.install --org_tree
-          mix px_imports.install --users --projects
+          mix px_imports.install --org-tree
+          mix px_imports.install --users
           mix px_imports.install --spend-types
           mix px_imports.install --month_close
-          mix px_imports.install --org_tree --users --projects
+          mix px_imports.install --positions
+          mix px_imports.install --org-tree --users
         """)
       else
         prefix = Igniter.Project.Module.module_name_prefix(igniter)
@@ -122,6 +122,7 @@ if Code.ensure_loaded?(Igniter) do
         sync_employees_worker_module = Module.concat([prefix, Workers, SyncEmployeesWorker])
         sync_projects_worker_module = Module.concat([prefix, Workers, SyncProjectsWorker])
         sync_spend_types_worker_module = Module.concat([prefix, Workers, SyncSpendTypesWorker])
+        sync_positions_worker_module = Module.concat([prefix, Workers, SyncPositionsWorker])
 
         sync_month_end_close_worker_module =
           Module.concat([prefix, Workers, SyncMonthEndCloseWorker])
@@ -131,11 +132,6 @@ if Code.ensure_loaded?(Igniter) do
           |> then(fn e ->
             if install_users?,
               do: e ++ [{"0 2 * * *", sync_employees_worker_module}],
-              else: e
-          end)
-          |> then(fn e ->
-            if install_projects?,
-              do: e ++ [{"30 2 * * *", sync_projects_worker_module}],
               else: e
           end)
           |> then(fn e ->
@@ -153,6 +149,11 @@ if Code.ensure_loaded?(Igniter) do
               do: e ++ [{"50 2 * * *", sync_month_end_close_worker_module}],
               else: e
           end)
+          |> then(fn e ->
+            if install_positions?,
+              do: e ++ [{"55 2 * * *", sync_positions_worker_module}],
+              else: e
+          end)
 
         org_tree_resources =
           if install_org_tree? do
@@ -161,7 +162,7 @@ if Code.ensure_loaded?(Igniter) do
               Module.concat([prefix, Projects, Cluster]),
               Module.concat([prefix, Projects, ClientGroup]),
               Module.concat([prefix, Projects, Client]),
-              Module.concat([prefix, Projects, Initiative])
+              Module.concat([prefix, Projects, Project])
             ]
           else
             []
@@ -169,11 +170,6 @@ if Code.ensure_loaded?(Igniter) do
 
         project_resources =
           []
-          |> then(fn resources ->
-            if install_projects?,
-              do: resources ++ [Module.concat([prefix, Projects, Project])],
-              else: resources
-          end)
           |> then(fn resources ->
             if install_spend_types?,
               do: resources ++ [Module.concat([prefix, Projects, SpendType])],
@@ -184,12 +180,23 @@ if Code.ensure_loaded?(Igniter) do
               do: resources ++ [Module.concat([prefix, Projects, MonthEndClose])],
               else: resources
           end)
+          |> then(fn resources ->
+            if install_positions? do
+              resources ++
+                [
+                  Module.concat([prefix, Projects, Position]),
+                  Module.concat([prefix, Projects, PositionRelationship])
+                ]
+            else
+              resources
+            end
+          end)
 
         all_project_resources = org_tree_resources ++ project_resources
 
         domains_to_add =
-          if install_org_tree? or install_projects? or install_spend_types? or
-               install_month_close?,
+          if install_org_tree? or install_spend_types? or install_month_close? or
+               install_positions?,
              do: [projects_domain_module],
              else: []
 
@@ -231,10 +238,15 @@ if Code.ensure_loaded?(Igniter) do
               projects_domain_module,
               repo_module
             )
-            |> create_initiative(
-              Module.concat([prefix, Projects, Initiative]),
+            |> create_project_resource(
+              Module.concat([prefix, Projects, Project]),
               projects_domain_module,
               repo_module
+            )
+            |> create_sync_projects_worker(
+              sync_projects_worker_module,
+              projects_domain_module,
+              prefix
             )
             |> create_sync_org_tree_worker(
               sync_org_tree_worker_module,
@@ -259,36 +271,12 @@ if Code.ensure_loaded?(Igniter) do
           end
         end)
         |> then(fn ign ->
-          if install_projects? do
-            ign
-            |> then(fn i ->
-              if install_org_tree? do
-                i
-              else
-                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
-              end
-            end)
-            |> create_project_resource(
-              Module.concat([prefix, Projects, Project]),
-              projects_domain_module,
-              repo_module
-            )
-            |> create_sync_projects_worker(
-              sync_projects_worker_module,
-              projects_domain_module,
-              prefix
-            )
-          else
-            ign
-          end
-        end)
-        |> then(fn ign ->
           if install_spend_types? do
             spend_type_module = Module.concat([prefix, Projects, SpendType])
 
             ign
             |> then(fn i ->
-              if install_org_tree? or install_projects? do
+              if install_org_tree? or install_spend_types? do
                 i
               else
                 create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
@@ -315,7 +303,7 @@ if Code.ensure_loaded?(Igniter) do
 
             ign
             |> then(fn i ->
-              if install_org_tree? or install_projects? or install_spend_types? do
+              if install_org_tree? or install_spend_types? do
                 i
               else
                 create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
@@ -329,6 +317,40 @@ if Code.ensure_loaded?(Igniter) do
             )
             |> create_sync_month_end_close_worker(
               sync_month_end_close_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
+        |> then(fn ign ->
+          if install_positions? do
+            position_module = Module.concat([prefix, Projects, Position])
+            position_relationship_module = Module.concat([prefix, Projects, PositionRelationship])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_spend_types? or install_month_close? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, position_module)
+            |> ensure_resource_in_domain(projects_domain_module, position_relationship_module)
+            |> create_position_resource(
+              position_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_position_relationship_resource(
+              position_relationship_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_positions_worker(
+              sync_positions_worker_module,
               projects_domain_module,
               prefix
             )
@@ -365,6 +387,10 @@ if Code.ensure_loaded?(Igniter) do
         7. To install month end close sync only:
 
              mix px_imports.install --month_close
+
+        8. To install positions sync only:
+
+             mix px_imports.install --positions
         """)
       end
     end
@@ -424,10 +450,15 @@ if Code.ensure_loaded?(Igniter) do
         else
           otp_app_str = inspect(otp_app)
 
+          merged_cron_entries =
+            content
+            |> extract_existing_cron_entries()
+            |> merge_cron_entries(cron_entries)
+
           crontab_lines =
-            cron_entries
+            merged_cron_entries
             |> Enum.map(fn {cron, worker} ->
-              ~s|       {"#{cron}", #{inspect(worker)}}|
+              ~s|       {"#{cron}", #{worker}}|
             end)
             |> Enum.join(",\n")
 
@@ -444,7 +475,7 @@ if Code.ensure_loaded?(Igniter) do
               String.contains?(content, "#{otp_app_str}, Oban") and
                   String.contains?(content, "Oban.Plugins.Cron") ->
                 Regex.replace(
-                  ~r/\{Oban\.Plugins\.Cron,\s*crontab:\s*\[.*?\]\s*\}/s,
+                  ~r/\{Oban\.Plugins\.Cron,\s*.*?\}/s,
                   content,
                   new_cron_plugin,
                   global: false
@@ -484,6 +515,33 @@ if Code.ensure_loaded?(Igniter) do
           Rewrite.Source.update(source, :content, new_content)
         end
       end)
+    end
+
+    defp extract_existing_cron_entries(content) do
+      case Regex.run(
+             ~r/\{Oban\.Plugins\.Cron,\s*.*?crontab:\s*\[(.*?)\]\s*\}/s,
+             content,
+             capture: :all_but_first
+           ) do
+        [entries_block] ->
+          Regex.scan(~r/\{"([^"]+)",\s*([^\}]+)\}/, entries_block)
+          |> Enum.map(fn [_, cron, worker] -> {cron, String.trim(worker)} end)
+
+        _ ->
+          []
+      end
+    end
+
+    defp merge_cron_entries(existing_entries, new_entries) do
+      new_entries_as_strings =
+        Enum.map(new_entries, fn {cron, worker} -> {cron, inspect(worker)} end)
+
+      (existing_entries ++ new_entries_as_strings)
+      |> Enum.reduce(%{}, fn {cron, worker}, acc ->
+        Map.put(acc, worker, cron)
+      end)
+      |> Enum.map(fn {worker, cron} -> {cron, worker} end)
+      |> Enum.sort_by(fn {_cron, worker} -> worker end)
     end
 
     # ──────────────────────────────────────────────
@@ -1179,7 +1237,7 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp stage_keys do
-          ["business_units", "clusters", "client_groups", "clients", "initiatives"]
+          ["business_units", "clusters", "client_groups", "clients", "projects"]
         end
 
         defp stage_count(meta, key) do
@@ -1737,123 +1795,6 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
-    defp create_initiative(igniter, module, domain_module, repo_module) do
-      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
-
-      if exists? do
-        igniter
-      else
-        client_module = Module.concat(domain_module, Client)
-
-        contents = """
-        use Ash.Resource,
-          domain: #{inspect(domain_module)},
-          data_layer: AshPostgres.DataLayer,
-          authorizers: [Ash.Policy.Authorizer]
-
-        postgres do
-          table "initiatives"
-          repo #{inspect(repo_module)}
-        end
-
-        actions do
-          defaults [:read]
-
-          create :create do
-            primary? true
-            accept [
-              :initiative_key, :summary, :description, :scope, :goals,
-              :client_id, :needs_px, :delivery_manager, :delivery_manager_sap_id,
-              :sap_project_ids, :start_date, :end_date, :hidden_at
-            ]
-          end
-
-          update :sync_from_px do
-            accept [
-              :summary, :description, :scope, :goals, :client_id, :needs_px,
-              :delivery_manager, :delivery_manager_sap_id, :sap_project_ids,
-              :start_date, :end_date, :hidden_at
-            ]
-          end
-        end
-
-        policies do
-          bypass always() do
-            authorize_if always()
-          end
-        end
-
-        attributes do
-          attribute :initiative_key, :string do
-            primary_key? true
-            allow_nil? false
-            public? true
-          end
-
-          attribute :summary, :string do
-            allow_nil? false
-            public? true
-          end
-
-          attribute :description, :string do
-            public? true
-          end
-
-          attribute :scope, :string do
-            public? true
-          end
-
-          attribute :goals, :string do
-            public? true
-          end
-
-          attribute :client_id, :integer do
-            allow_nil? false
-            public? true
-          end
-
-          attribute :needs_px, :boolean do
-            public? true
-          end
-
-          attribute :delivery_manager, :string do
-            public? true
-          end
-
-          attribute :delivery_manager_sap_id, :integer do
-            public? true
-          end
-
-          attribute :sap_project_ids, {:array, :integer} do
-            public? true
-          end
-
-          attribute :start_date, :utc_datetime do
-            public? true
-          end
-
-          attribute :end_date, :utc_datetime do
-            public? true
-          end
-
-          attribute :hidden_at, :utc_datetime do
-            public? true
-          end
-        end
-
-        relationships do
-          belongs_to :client, #{inspect(client_module)} do
-            source_attribute :client_id
-            destination_attribute :id
-            define_attribute? false
-          end
-        end
-        """
-
-        Igniter.Project.Module.create_module(igniter, module, contents)
-      end
-    end
-
     defp create_sync_org_tree_worker(igniter, module, domain_module, prefix) do
       {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
 
@@ -1865,11 +1806,11 @@ if Code.ensure_loaded?(Igniter) do
         cluster_module = Module.concat(domain_module, Cluster)
         cg_module = Module.concat(domain_module, ClientGroup)
         client_module = Module.concat(domain_module, Client)
-        initiative_module = Module.concat(domain_module, Initiative)
+        sync_projects_worker_module = Module.concat([prefix, Workers, SyncProjectsWorker])
 
         contents = """
         @moduledoc \"\"\"
-        Synchronizes PX organizational tree entities in dependency order.
+        Synchronizes PX organizational tree entities and projects in dependency order.
         \"\"\"
 
         use Oban.Worker, queue: :default, max_attempts: 3
@@ -1879,7 +1820,7 @@ if Code.ensure_loaded?(Igniter) do
         alias #{inspect(cluster_module)}
         alias #{inspect(cg_module)}
         alias #{inspect(client_module)}
-        alias #{inspect(initiative_module)}
+        alias #{inspect(sync_projects_worker_module)}
         alias #{inspect(repo_module)}
 
         @impl Oban.Worker
@@ -1918,7 +1859,7 @@ if Code.ensure_loaded?(Igniter) do
               clusters: clusters,
               client_groups: client_groups,
               clients: clients,
-              initiatives: initiatives
+              projects: projects
             }) do
           {:ok,
            %{}
@@ -1926,7 +1867,7 @@ if Code.ensure_loaded?(Igniter) do
            |> Map.put(:clusters, sync_clusters(clusters))
            |> Map.put(:client_groups, sync_client_groups(client_groups))
            |> Map.put(:clients, sync_clients(clients))
-           |> Map.put(:initiatives, sync_initiatives(initiatives))}
+           |> Map.put(:projects, sync_projects(projects))}
         end
 
         defp run_sync do
@@ -1934,14 +1875,14 @@ if Code.ensure_loaded?(Igniter) do
                {:ok, clusters} <- BluetabConnect.Px.Rest.list_clusters(),
                {:ok, client_groups} <- BluetabConnect.Px.Rest.list_client_groups(),
                {:ok, clients} <- BluetabConnect.Px.Rest.list_clients(),
-               {:ok, initiatives} <- BluetabConnect.Px.Rest.list_initiatives(),
+               {:ok, projects} <- fetch_all_projects(),
                {:ok, summary} <-
                  execute(%{
                    business_units: business_units,
                    clusters: clusters,
                    client_groups: client_groups,
                    clients: clients,
-                   initiatives: initiatives
+                   projects: projects
                  }) do
             {:ok, summary}
           else
@@ -1966,8 +1907,8 @@ if Code.ensure_loaded?(Igniter) do
           sync_resource(:clients, Client, items, :id, &map_client/1)
         end
 
-        defp sync_initiatives(items) do
-          sync_resource(:initiatives, Initiative, items, :initiative_key, &map_initiative/1)
+        defp sync_projects(items) do
+          SyncProjectsWorker.execute(items)
         end
 
         defp sync_resource(_stage_name, resource, items, key_field, mapper) do
@@ -2149,24 +2090,6 @@ if Code.ensure_loaded?(Igniter) do
           |> drop_nil_values()
         end
 
-        defp map_initiative(raw) do
-          %{
-            initiative_key: normalize_string(raw["initiative_key"]),
-            summary: normalize_string(raw["summary"]),
-            description: normalize_string(raw["description"]),
-            scope: normalize_string(raw["scope"]),
-            goals: normalize_string(raw["goals"]),
-            client_id: parse_integer(raw["client_id"]),
-            needs_px: raw["needs_px"],
-            delivery_manager: normalize_string(raw["delivery_manager"]),
-            delivery_manager_sap_id: parse_integer(raw["delivery_manager_sap_id"]),
-            sap_project_ids: parse_integer_list(raw["sap_project_ids"]),
-            start_date: parse_datetime(raw["startDate"]),
-            end_date: parse_datetime(raw["endDate"])
-          }
-          |> drop_nil_values()
-        end
-
         defp drop_nil_values(map) do
           map
           |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -2190,16 +2113,6 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp parse_integer(_), do: nil
-
-        defp parse_integer_list(nil), do: nil
-
-        defp parse_integer_list(list) when is_list(list) do
-          list
-          |> Enum.map(&parse_integer/1)
-          |> Enum.reject(&is_nil/1)
-        end
-
-        defp parse_integer_list(_), do: nil
 
         defp normalize_string(nil), do: nil
 
@@ -2229,6 +2142,23 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp parse_datetime(_), do: nil
+
+        defp fetch_all_projects(page \\\\ 1, acc \\\\ []) do
+          case BluetabConnect.Px.Rest.list_projects(
+                 page: page,
+                 per_page: 100,
+                 fields: "client_id,owner,is_time_off,cluster_id"
+               ) do
+            {:ok, %{"projects" => [], "pagination" => _pagination}} ->
+              {:ok, acc}
+
+            {:ok, %{"projects" => projects, "pagination" => _pagination}} ->
+              fetch_all_projects(page + 1, acc ++ projects)
+
+            error ->
+              error
+          end
+        end
         """
 
         Igniter.Project.Module.create_module(igniter, module, contents)
@@ -2258,16 +2188,6 @@ if Code.ensure_loaded?(Igniter) do
       )
       |> Ash.Resource.Igniter.add_new_attribute(
         user_module,
-        :ssff_id,
-        "attribute :ssff_id, :string"
-      )
-      |> Ash.Resource.Igniter.add_new_attribute(
-        user_module,
-        :manager_employee_number,
-        "attribute :manager_employee_number, :integer"
-      )
-      |> Ash.Resource.Igniter.add_new_attribute(
-        user_module,
         :category,
         "attribute :category, :string"
       )
@@ -2276,30 +2196,27 @@ if Code.ensure_loaded?(Igniter) do
         :category_name,
         "attribute :category_name, :string"
       )
-      |> Ash.Resource.Igniter.add_new_attribute(
+      |> Ash.Resource.Igniter.add_new_action(
         user_module,
-        :weekly_hours,
-        "attribute :weekly_hours, :integer"
-      )
-      |> Ash.Resource.Igniter.add_new_attribute(
-        user_module,
-        :is_active,
-        "attribute :is_active, :boolean"
-      )
-      |> Ash.Resource.Igniter.add_new_attribute(
-        user_module,
-        :full_name,
-        "attribute :full_name, :string"
-      )
-      |> Ash.Resource.Igniter.add_new_attribute(
-        user_module,
-        :first_name,
-        "attribute :first_name, :string"
-      )
-      |> Ash.Resource.Igniter.add_new_attribute(
-        user_module,
-        :last_name,
-        "attribute :last_name, :string"
+        :provision_from_employee_sync,
+        """
+        create :provision_from_employee_sync do
+          description \"Create a user from PX employee data when they have not signed in yet\"
+
+          accept [
+            :email,
+            :given_name,
+            :family_name,
+            :join_date,
+            :hidden_at,
+            :sap_id,
+            :category,
+            :category_name
+          ]
+
+          change set_attribute(:confirmed_at, &DateTime.utc_now/0)
+        end
+        """
       )
       |> Ash.Resource.Igniter.add_new_action(
         user_module,
@@ -2310,12 +2227,8 @@ if Code.ensure_loaded?(Igniter) do
             :join_date,
             :hidden_at,
             :sap_id,
-            :ssff_id,
-            :manager_employee_number,
             :category,
-            :category_name,
-            :weekly_hours,
-            :is_active
+            :category_name
           ]
         end
         """
@@ -2329,30 +2242,32 @@ if Code.ensure_loaded?(Igniter) do
         igniter
       else
         repo_module = Module.concat(prefix, Repo)
+        accounts_module = Module.concat(prefix, Accounts)
 
         contents = """
         @moduledoc \"\"\"
         Synchronizes PX employee data into Accounts.User records.
 
-        Matches employees to existing users by email (never overwrites email).
-        Updates: `sap_id` from `sap_employee_number`, `join_date` from
-        `start_date` (only when join_date was nil), `hidden_at` from
-        `termination_date`, and `ssff_id`, `manager_employee_number`, `category`,
-        `category_name`, `weekly_hours`, and `is_active` when they differ from PX.
+        Matches employees to existing users by email address. Updates employee
+        fields on existing users (sap_id, join_date, hidden_at from termination_date,
+        `category` and `category_name` from PX). Creates new users when no row exists
+        for the employee email yet.
 
-        Does not sync `full_name`, `first_name`, or `last_name`.
+        Reporting structure is synced via `SyncPositionsWorker`, not from employee records.
         \"\"\"
 
         use Oban.Worker, queue: :default, max_attempts: 3
 
-        import Ecto.Query
+        require Ash.Query
+        require Ash.Expr
 
-        alias #{inspect(user_module)}
+        alias #{inspect(accounts_module)}
+        alias #{inspect(user_module)}, as: User
         alias #{inspect(repo_module)}
 
         @impl Oban.Worker
         def perform(job) do
-          with {:ok, employees} <- BluetabConnect.Px.Rest.list_employees() do
+          with {:ok, %{"employees" => employees}} <- BluetabConnect.Px.Rest.list_employees() do
             result = execute(employees)
             details = Map.put(result, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
 
@@ -2373,48 +2288,192 @@ if Code.ensure_loaded?(Igniter) do
 
         @doc false
         def sync_employees(employees) do
-          emails = Enum.map(employees, & &1["email"])
+          emails =
+            employees
+            |> Enum.map(&normalize_email(&1["email"]))
+            |> Enum.reject(&is_nil/1)
+            |> Enum.uniq()
 
           users_by_email =
-            from(u in User, where: u.email in ^emails)
-            |> Repo.all()
-            |> Map.new(&{&1.email, &1})
+            if emails == [] do
+              %{}
+            else
+              User
+              |> Ash.Query.filter(Ash.Expr.expr(email in ^emails))
+              |> Ash.read!(domain: Accounts, authorize?: false)
+              |> Map.new(&{&1.email, &1})
+            end
 
-          results =
-            Enum.reduce(employees, %{updated: [], skipped: [], not_found: []}, fn employee, acc ->
-              case Map.get(users_by_email, employee["email"]) do
-                nil ->
-                  %{acc | not_found: [employee["email"] | acc.not_found]}
+          init = %{updated: [], skipped: [], created: [], failed: [], not_found: []}
 
-                user ->
-                  case maybe_update_user(user, employee) do
-                    {:updated, changes} ->
-                      %{acc | updated: [%{email: user.email, changes: changes} | acc.updated]}
+          {_, results} =
+            Enum.reduce(employees, {users_by_email, init}, fn employee, {by_email, acc} ->
+              email = normalize_email(employee["email"])
 
-                    :no_changes ->
-                      %{acc | skipped: [user.email | acc.skipped]}
+              cond do
+                is_nil(email) ->
+                  {by_email, %{acc | skipped: [skipped_label(employee, :no_email) | acc.skipped]}}
+
+                true ->
+                  case Map.get(by_email, email) do
+                    nil ->
+                      case create_user_from_employee(employee) do
+                        {:ok, user} ->
+                          name = user_display_name(user)
+
+                          entry = %{
+                            "email" => user.email,
+                            "name" => name,
+                            "sap_id" => user.sap_id
+                          }
+
+                          {Map.put(by_email, user.email, user), %{acc | created: [entry | acc.created]}}
+
+                        {:error, reason} ->
+                          err = %{
+                            "email" => email,
+                            "sap_id" => parse_integer_field(employee["sap_employee_number"]),
+                            "error" => format_ash_error(reason)
+                          }
+
+                          {by_email, %{acc | failed: [err | acc.failed]}}
+                      end
+
+                    user ->
+                      case maybe_update_user(user, employee) do
+                        {:updated, changes} ->
+                          {by_email,
+                           %{acc | updated: [%{email: user.email, changes: changes} | acc.updated]}}
+
+                        :no_changes ->
+                          {by_email, %{acc | skipped: [user.email | acc.skipped]}}
+                      end
                   end
               end
             end)
 
           %{
             total_employees: length(employees),
+            created_count: length(results.created),
             updated_count: length(results.updated),
             skipped_count: length(results.skipped),
+            failed_count: length(results.failed),
             not_found_count: length(results.not_found),
+            created: Enum.reverse(results.created),
             updated: Enum.reverse(results.updated),
             skipped: Enum.reverse(results.skipped),
+            failed: Enum.reverse(results.failed),
             not_found: Enum.reverse(results.not_found)
           }
         end
+
+        defp normalize_email(nil), do: nil
+
+        defp normalize_email(email) when is_binary(email) do
+          case String.trim(email) do
+            "" -> nil
+            e -> e
+          end
+        end
+
+        defp normalize_email(_), do: nil
+
+        defp skipped_label(employee, :no_email) do
+          sap = parse_integer_field(employee["sap_employee_number"])
+
+          case sap do
+            nil -> "Missing email"
+            n -> "Missing email (SAP: " <> Integer.to_string(n) <> ")"
+          end
+        end
+
+        defp user_display_name(%User{} = user) do
+          [user.given_name, user.family_name]
+          |> Enum.reject(&(&1 in [nil, ""]))
+          |> Enum.join(" ")
+        end
+
+        defp format_ash_error(%Ash.Changeset{} = cs), do: inspect(cs.errors)
+        defp format_ash_error(other), do: inspect(other)
+
+        defp create_user_from_employee(employee) do
+          attrs = build_provision_attrs(employee)
+
+          case attrs[:email] do
+            nil ->
+              {:error, :missing_email}
+
+            _ ->
+              User
+              |> Ash.Changeset.for_create(:provision_from_employee_sync, attrs)
+              |> Ash.create(domain: Accounts, authorize?: false)
+          end
+        end
+
+        defp build_provision_attrs(employee) do
+          {given, family} = employee_name_parts(employee)
+
+          %{email: normalize_email(employee["email"]), given_name: given, family_name: family}
+          |> put_if_present(:join_date, parse_start_date(employee["start_date"]))
+          |> put_if_present(:hidden_at, parse_termination_date(employee["termination_date"]))
+          |> put_if_present(:sap_id, parse_integer_field(employee["sap_employee_number"]))
+          |> Map.put(:category, normalize_optional_string(employee["category"]))
+          |> Map.put(:category_name, normalize_optional_string(employee["category_name"]))
+        end
+
+        defp put_if_present(attrs, _key, nil), do: attrs
+        defp put_if_present(attrs, key, value), do: Map.put(attrs, key, value)
+
+        defp employee_name_parts(emp) do
+          given = normalize_optional_string(emp["given_name"] || emp["first_name"])
+          family = normalize_optional_string(emp["family_name"] || emp["last_name"])
+
+          if given || family do
+            {given, family}
+          else
+            parse_full_name(emp["full_name"])
+          end
+        end
+
+        defp normalize_optional_string(nil), do: nil
+
+        defp normalize_optional_string(s) when is_binary(s) do
+          case String.trim(s) do
+            "" -> nil
+            t -> t
+          end
+        end
+
+        defp normalize_optional_string(_), do: nil
+
+        defp parse_full_name(nil), do: {nil, nil}
+
+        defp parse_full_name(name) when is_binary(name) do
+          case String.trim(name) |> String.split(~r/\\s+/, trim: true) do
+            [] -> {nil, nil}
+            [one] -> {one, nil}
+            [g | rest] -> {g, Enum.join(rest, " ")}
+          end
+        end
+
+        defp parse_full_name(_), do: {nil, nil}
+
+        defp parse_start_date(nil), do: nil
+
+        defp parse_start_date(date_string) when is_binary(date_string) do
+          Date.from_iso8601!(date_string)
+        end
+
+        defp parse_start_date(_), do: nil
 
         defp maybe_update_user(user, employee) do
           attrs = build_update_attrs(user, employee)
 
           if map_size(attrs) > 0 do
-            user
-            |> Ash.Changeset.for_update(:sync_employee_fields, attrs)
-            |> Ash.update!(authorize?: false)
+            _updated =
+              user
+              |> Ash.Changeset.for_update(:sync_employee_fields, attrs)
+              |> Ash.update!(authorize?: false)
 
             changes =
               Enum.map(attrs, fn {field, value} ->
@@ -2432,12 +2491,8 @@ if Code.ensure_loaded?(Igniter) do
           |> maybe_put_join_date(user, employee)
           |> maybe_put_hidden_at(user, employee)
           |> maybe_put_sap_id(user, employee)
-          |> maybe_put_ssff_id(user, employee)
-          |> maybe_put_manager_employee_number(user, employee)
           |> maybe_put_category(user, employee)
           |> maybe_put_category_name(user, employee)
-          |> maybe_put_weekly_hours(user, employee)
-          |> maybe_put_is_active(user, employee)
         end
 
         defp maybe_put_join_date(attrs, user, employee) do
@@ -2461,7 +2516,7 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp maybe_put_sap_id(attrs, user, employee) do
-          sap_id = parse_sap_id(employee["sap_employee_number"])
+          sap_id = parse_integer_field(employee["sap_employee_number"])
 
           cond do
             is_nil(sap_id) -> attrs
@@ -2470,30 +2525,10 @@ if Code.ensure_loaded?(Igniter) do
           end
         end
 
-        defp maybe_put_ssff_id(attrs, user, employee) do
-          desired = normalize_string_field(employee["ssff_id"])
-
-          if normalize_string_field(user.ssff_id) != desired do
-            Map.put(attrs, :ssff_id, desired)
-          else
-            attrs
-          end
-        end
-
-        defp maybe_put_manager_employee_number(attrs, user, employee) do
-          n = parse_sap_id(employee["manager_employee_number"])
-
-          if user.manager_employee_number != n do
-            Map.put(attrs, :manager_employee_number, n)
-          else
-            attrs
-          end
-        end
-
         defp maybe_put_category(attrs, user, employee) do
-          desired = normalize_string_field(employee["category"])
+          desired = normalize_optional_string(employee["category"])
 
-          if normalize_string_field(user.category) != desired do
+          if normalize_optional_string(Map.get(user, :category)) != desired do
             Map.put(attrs, :category, desired)
           else
             attrs
@@ -2501,71 +2536,14 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp maybe_put_category_name(attrs, user, employee) do
-          desired = normalize_string_field(employee["category_name"])
+          desired = normalize_optional_string(employee["category_name"])
 
-          if normalize_string_field(user.category_name) != desired do
+          if normalize_optional_string(Map.get(user, :category_name)) != desired do
             Map.put(attrs, :category_name, desired)
           else
             attrs
           end
         end
-
-        defp maybe_put_weekly_hours(attrs, user, employee) do
-          n = parse_weekly_hours(employee["weekly_hours"])
-
-          if user.weekly_hours != n do
-            Map.put(attrs, :weekly_hours, n)
-          else
-            attrs
-          end
-        end
-
-        defp maybe_put_is_active(attrs, user, employee) do
-          n = parse_boolean(employee["is_active"])
-
-          if user.is_active != n do
-            Map.put(attrs, :is_active, n)
-          else
-            attrs
-          end
-        end
-
-        defp normalize_string_field(nil), do: nil
-
-        defp normalize_string_field(s) when is_binary(s) do
-          case String.trim(s) do
-            "" -> nil
-            t -> t
-          end
-        end
-
-        defp normalize_string_field(_), do: nil
-
-        defp parse_weekly_hours(nil), do: nil
-        defp parse_weekly_hours(n) when is_integer(n), do: n
-        defp parse_weekly_hours(n) when is_float(n), do: round(n)
-
-        defp parse_weekly_hours(s) when is_binary(s) do
-          case Integer.parse(s) do
-            {i, ""} ->
-              i
-
-            _ ->
-              case Float.parse(s) do
-                {f, ""} -> round(f)
-                _ -> nil
-              end
-          end
-        end
-
-        defp parse_weekly_hours(_), do: nil
-
-        defp parse_boolean(nil), do: nil
-        defp parse_boolean(true), do: true
-        defp parse_boolean(false), do: false
-        defp parse_boolean("true"), do: true
-        defp parse_boolean("false"), do: false
-        defp parse_boolean(_), do: nil
 
         defp parse_termination_date(nil), do: nil
 
@@ -2575,17 +2553,17 @@ if Code.ensure_loaded?(Igniter) do
           |> DateTime.new!(~T[00:00:00], "Etc/UTC")
         end
 
-        defp parse_sap_id(nil), do: nil
-        defp parse_sap_id(value) when is_integer(value), do: value
+        defp parse_integer_field(nil), do: nil
+        defp parse_integer_field(value) when is_integer(value), do: value
 
-        defp parse_sap_id(value) when is_binary(value) do
+        defp parse_integer_field(value) when is_binary(value) do
           case Integer.parse(value) do
             {number, ""} -> number
             _ -> nil
           end
         end
 
-        defp parse_sap_id(_), do: nil
+        defp parse_integer_field(_), do: nil
 
         defp hidden_at_changed?(nil, nil), do: false
         defp hidden_at_changed?(nil, %DateTime{}), do: true
@@ -3327,6 +3305,544 @@ if Code.ensure_loaded?(Igniter) do
     end
 
     # ──────────────────────────────────────────────
+    # Positions: Position + PositionRelationship + SyncPositionsWorker
+    # ──────────────────────────────────────────────
+
+    defp create_position_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "positions"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+
+            accept [
+              :id,
+              :name,
+              :is_default,
+              :is_active,
+              :employee_number,
+              :default_for_employee_number,
+              :manager_position_id,
+              :hidden_at
+            ]
+          end
+
+          update :sync_from_px do
+            accept [
+              :name,
+              :is_default,
+              :is_active,
+              :employee_number,
+              :default_for_employee_number,
+              :manager_position_id,
+              :hidden_at
+            ]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          attribute :id, :integer do
+            primary_key? true
+            allow_nil? false
+            public? true
+          end
+
+          attribute :name, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :is_default, :boolean do
+            public? true
+          end
+
+          attribute :is_active, :boolean do
+            public? true
+          end
+
+          attribute :employee_number, :integer do
+            public? true
+          end
+
+          attribute :default_for_employee_number, :integer do
+            public? true
+          end
+
+          attribute :manager_position_id, :integer do
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_position_relationship_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        position_module = Module.concat(domain_module, Position)
+
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "position_relationships"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+            accept [:position_id, :manager_position_id, :hidden_at]
+          end
+
+          update :sync_from_px do
+            accept [:manager_position_id, :hidden_at]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          attribute :position_id, :integer do
+            primary_key? true
+            allow_nil? false
+            public? true
+          end
+
+          attribute :manager_position_id, :integer do
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+
+        relationships do
+          belongs_to :position, #{inspect(position_module)} do
+            source_attribute :position_id
+            destination_attribute :id
+            define_attribute? false
+          end
+
+          belongs_to :manager_position, #{inspect(position_module)} do
+            source_attribute :manager_position_id
+            destination_attribute :id
+            define_attribute? false
+          end
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_positions_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        position_module = Module.concat(domain_module, Position)
+        position_relationship_module = Module.concat(domain_module, PositionRelationship)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes PX positions and current position relationships into local resources.
+
+        `assigned_employee` is intentionally ignored for now.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(position_module)}, as: Position
+        alias #{inspect(position_relationship_module)}, as: PositionRelationship
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs positions and relationships payload into local resources.
+        \"\"\"
+        def execute(%{positions: positions, relationships: relationships})
+            when is_list(positions) and is_list(relationships) do
+          positions_result = sync_positions(positions)
+          relationships_result = sync_position_relationships(relationships)
+
+          %{
+            total_positions: length(positions),
+            total_relationships: length(relationships),
+            positions: positions_result,
+            relationships: relationships_result
+          }
+        end
+
+        def execute(_), do: empty_result()
+
+        defp run_sync do
+          case BluetabConnect.Px.Rest.list_positions() do
+            {:ok, %{"positions" => positions, "relationships" => relationships}}
+            when is_list(positions) and is_list(relationships) ->
+              {:ok, execute(%{positions: positions, relationships: relationships})}
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp sync_positions(items) do
+          sync_resource(Position, items, :id, &map_position/1)
+        end
+
+        defp sync_position_relationships(items) do
+          sync_resource(PositionRelationship, items, :position_id, &map_relationship/1)
+        end
+
+        defp sync_resource(resource, items, key_field, mapper) do
+          existing_items = Ash.read!(resource, domain: Projects, authorize?: false)
+          existing_by_key = Map.new(existing_items, &{Map.get(&1, key_field), &1})
+
+          result =
+            Enum.reduce(
+              items,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_item, acc ->
+                attrs = mapper.(raw_item)
+                key = Map.get(attrs, key_field)
+                name = Map.get(attrs, :name)
+
+                if is_nil(key) do
+                  %{
+                    acc
+                    | failed: [
+                        %{item: raw_item, error: "missing \#{key_field}"}
+                        | acc.failed
+                      ]
+                  }
+                else
+                  case Map.get(existing_by_key, key) do
+                    nil ->
+                      case Ash.create(resource, attrs,
+                             action: :create,
+                             domain: Projects,
+                             authorize?: false
+                           ) do
+                        {:ok, _created} ->
+                          %{acc | created: [resource_entry(key_field, key, name) | acc.created]}
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                resource_entry(key_field, key, name)
+                                |> Map.put(:error, inspect(error))
+                                | acc.failed
+                              ]
+                          }
+                      end
+
+                    existing ->
+                      changes = build_changes(existing, attrs, key_field)
+
+                      if map_size(changes) == 0 do
+                        %{acc | skipped: [resource_entry(key_field, key, name) | acc.skipped]}
+                      else
+                        case existing
+                             |> Ash.Changeset.for_update(:sync_from_px, changes)
+                             |> Ash.update(authorize?: false) do
+                          {:ok, _updated} ->
+                            %{
+                              acc
+                              | updated: [
+                                  resource_entry(key_field, key, name)
+                                  |> Map.put(:changes, presentable_changes(changes))
+                                  | acc.updated
+                                ]
+                            }
+
+                          {:error, error} ->
+                            %{
+                              acc
+                              | failed: [
+                                  resource_entry(key_field, key, name)
+                                  |> Map.put(:error, inspect(error))
+                                  | acc.failed
+                                ]
+                            }
+                        end
+                      end
+                  end
+                end
+              end
+            )
+
+          incoming_keys =
+            items
+            |> Enum.map(&mapper.(&1))
+            |> Enum.map(&Map.get(&1, key_field))
+            |> Enum.reject(&is_nil/1)
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_items, incoming_keys, key_field, result)
+
+          %{
+            total: length(items),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp soft_hide_missing(existing_items, incoming_keys, key_field, result) do
+          Enum.reduce(existing_items, result, fn item, acc ->
+            key = Map.get(item, key_field)
+            name = Map.get(item, :name)
+
+            cond do
+              MapSet.member?(incoming_keys, key) ->
+                acc
+
+              not is_nil(item.hidden_at) ->
+                acc
+
+              true ->
+                case item
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [resource_entry(key_field, key, name) | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [
+                          resource_entry(key_field, key, name)
+                          |> Map.put(:error, inspect(error))
+                          | acc.failed
+                        ]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp map_position(raw) do
+          manager_position_id = parse_integer(raw["manager_position_id"])
+
+          %{
+            id: parse_integer(raw["id"]),
+            name: normalize_string(raw["name"]),
+            is_default: parse_boolean(raw["is_default"]),
+            is_active: parse_boolean(raw["is_active"]),
+            employee_number: parse_integer(raw["employee_number"]),
+            default_for_employee_number: parse_integer(raw["default_for_employee_number"]),
+            manager_position_id: manager_position_id
+          }
+          |> drop_nil_values()
+          |> Map.put(:manager_position_id, manager_position_id)
+        end
+
+        defp map_relationship(raw) do
+          %{
+            position_id: parse_integer(raw["position_id"]),
+            manager_position_id: parse_integer(raw["manager_position_id"])
+          }
+        end
+
+        defp resource_entry(key_field, key, name) do
+          entry = Map.put(%{}, key_field, key)
+
+          if is_nil(name) do
+            entry
+          else
+            Map.put(entry, :name, name)
+          end
+        end
+
+        defp build_changes(existing, attrs, key_field) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([key_field])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp empty_stage_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp empty_result do
+          %{
+            total_positions: 0,
+            total_relationships: 0,
+            positions: empty_stage_result(),
+            relationships: empty_stage_result()
+          }
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(value), do: inspect(value)
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp parse_boolean(nil), do: nil
+        defp parse_boolean(value) when is_boolean(value), do: value
+        defp parse_boolean(1), do: true
+        defp parse_boolean(0), do: false
+
+        defp parse_boolean(value) when is_binary(value) do
+          case String.downcase(String.trim(value)) do
+            "true" -> true
+            "false" -> false
+            "1" -> true
+            "0" -> false
+            _ -> nil
+          end
+        end
+
+        defp parse_boolean(_), do: nil
+
+        defp parse_integer(nil), do: nil
+        defp parse_integer(value) when is_integer(value), do: value
+        defp parse_integer(value) when is_float(value), do: trunc(value)
+
+        defp parse_integer(value) when is_binary(value) do
+          case Integer.parse(value) do
+            {number, ""} -> number
+            _ -> parse_float_string(value)
+          end
+        end
+
+        defp parse_integer(_), do: nil
+
+        defp parse_float_string(value) do
+          case Float.parse(value) do
+            {number, ""} -> trunc(number)
+            _ -> nil
+          end
+        end
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
     # Projects: Project resource + SyncProjectsWorker
     # ──────────────────────────────────────────────
 
@@ -3336,6 +3852,9 @@ if Code.ensure_loaded?(Igniter) do
       if exists? do
         igniter
       else
+        client_module = Module.concat(domain_module, Client)
+        cluster_module = Module.concat(domain_module, Cluster)
+
         contents = """
         use Ash.Resource,
           domain: #{inspect(domain_module)},
@@ -3352,11 +3871,33 @@ if Code.ensure_loaded?(Igniter) do
 
           create :create do
             primary? true
-            accept [:sap_id, :doc_num, :name, :start_date, :end_date, :status]
+
+            accept [
+              :sap_id,
+              :doc_num,
+              :name,
+              :owner_sap_id,
+              :client_id,
+              :cluster_id,
+              :is_time_off,
+              :start_date,
+              :end_date,
+              :status
+            ]
           end
 
           update :sync_from_px do
-            accept [:sap_id, :name, :start_date, :end_date, :status]
+            accept [
+              :sap_id,
+              :name,
+              :owner_sap_id,
+              :client_id,
+              :cluster_id,
+              :is_time_off,
+              :start_date,
+              :end_date,
+              :status
+            ]
           end
         end
 
@@ -3383,6 +3924,22 @@ if Code.ensure_loaded?(Igniter) do
             public? true
           end
 
+          attribute :owner_sap_id, :integer do
+            public? true
+          end
+
+          attribute :client_id, :integer do
+            public? true
+          end
+
+          attribute :cluster_id, :integer do
+            public? true
+          end
+
+          attribute :is_time_off, :boolean do
+            public? true
+          end
+
           attribute :start_date, :date do
             public? true
           end
@@ -3393,6 +3950,20 @@ if Code.ensure_loaded?(Igniter) do
 
           attribute :status, :string do
             public? true
+          end
+        end
+
+        relationships do
+          belongs_to :client, #{inspect(client_module)} do
+            source_attribute :client_id
+            destination_attribute :id
+            define_attribute? false
+          end
+
+          belongs_to :cluster, #{inspect(cluster_module)} do
+            source_attribute :cluster_id
+            destination_attribute :id
+            define_attribute? false
           end
         end
 
@@ -3420,6 +3991,10 @@ if Code.ensure_loaded?(Igniter) do
 
         Fetches all pages from the PX API and upserts changed records,
         keyed by doc_num (the stable unique identifier from PX).
+
+        The PX call explicitly requests `client_id`, `owner`, and `is_time_off` so project-client
+        ownership data is always present in the payload, even when PX defaults
+        would omit it.
         \"\"\"
 
         use Oban.Worker, queue: :default, max_attempts: 3
@@ -3452,7 +4027,11 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp fetch_all_projects(page \\\\ 1, acc \\\\ []) do
-          case BluetabConnect.Px.Rest.list_projects(page: page, per_page: 100) do
+          case BluetabConnect.Px.Rest.list_projects(
+                 page: page,
+                 per_page: 100,
+                 fields: "client_id,owner,is_time_off,cluster_id"
+               ) do
             {:ok, %{"projects" => [], "pagination" => _pagination}} ->
               {:ok, acc}
 
@@ -3486,6 +4065,7 @@ if Code.ensure_loaded?(Igniter) do
             )
 
           %{
+            total: length(projects),
             total_projects: length(projects),
             created_count: length(results.created),
             updated_count: length(results.updated),
@@ -3554,6 +4134,10 @@ if Code.ensure_loaded?(Igniter) do
             sap_id: parse_integer(raw["sap_id"]),
             doc_num: parse_integer(raw["doc_num"]),
             name: normalize_string(raw["name"]),
+            owner_sap_id: parse_integer(raw["owner"]),
+            client_id: parse_integer(raw["client_id"]),
+            cluster_id: parse_cluster_id(raw),
+            is_time_off: parse_boolean(raw["is_time_off"]),
             start_date: parse_date(raw["start_date"]),
             end_date: parse_date(raw["end_date"]),
             status: normalize_string(raw["status"])
@@ -3580,17 +4164,51 @@ if Code.ensure_loaded?(Igniter) do
           end)
         end
 
+        defp parse_cluster_id(raw) when is_map(raw) do
+          raw["cluster_id"] ||
+            raw["cluster"] ||
+            get_in(raw, ["cluster", "id"])
+            |> parse_integer()
+        end
+
+        defp parse_cluster_id(_), do: nil
+
         defp parse_integer(nil), do: nil
         defp parse_integer(value) when is_integer(value), do: value
+        defp parse_integer(value) when is_float(value), do: trunc(value)
 
         defp parse_integer(value) when is_binary(value) do
           case Integer.parse(value) do
             {number, ""} -> number
-            _ -> nil
+            _ -> parse_float_string(value)
           end
         end
 
         defp parse_integer(_), do: nil
+
+        defp parse_float_string(value) do
+          case Float.parse(value) do
+            {number, ""} -> trunc(number)
+            _ -> nil
+          end
+        end
+
+        defp parse_boolean(nil), do: nil
+        defp parse_boolean(value) when is_boolean(value), do: value
+        defp parse_boolean(1), do: true
+        defp parse_boolean(0), do: false
+
+        defp parse_boolean(value) when is_binary(value) do
+          case String.downcase(String.trim(value)) do
+            "true" -> true
+            "false" -> false
+            "1" -> true
+            "0" -> false
+            _ -> nil
+          end
+        end
+
+        defp parse_boolean(_), do: nil
 
         defp normalize_string(nil), do: nil
 
