@@ -40,10 +40,12 @@ if Code.ensure_loaded?(Igniter) do
         `SyncPositionsWorker` (daily at 02:55)
 
       * `--users` — patches `Accounts.User` with PX employee fields (see generated
-        resource), `:provision_from_employee_sync`, `:sync_employee_fields`, and
-        `SyncEmployeesWorker` (daily at 02:00). Sync creates users when an employee
-        email is not yet present. Stores PX `category` and `category_name` as strings
-        only (no separate Catalog domain).
+        resource), `:provision_from_employee_sync`, `:sync_employee_fields`,
+        `:list_for_admin`, `:set_admin`, and `SyncEmployeesWorker` (daily at 02:00).
+        Also generates `/admin/users` (`Admin.UsersLive`) and complete impersonation
+        flow (`ImpersonationController` + banner wiring in `LiveUserAuth`/`Layouts`).
+        Sync creates users when an employee email is not yet present. Stores PX
+        `category` and `category_name` as strings only (no separate Catalog domain).
 
         If this installer was already run with `--users`, Ash Igniter skips
         attributes and actions that already exist and does not overwrite an
@@ -109,13 +111,18 @@ if Code.ensure_loaded?(Igniter) do
 
         router_module = Module.concat(web_module, Router)
         live_user_auth_module = Module.concat(web_module, LiveUserAuth)
+        layouts_module = Module.concat(web_module, Layouts)
         repo_module = Module.concat(prefix, Repo)
+        accounts_module = Module.concat(prefix, Accounts)
         user_resource_module = Module.concat([prefix, Accounts, User])
 
         jobs_module = Module.concat(prefix, Jobs)
+        home_live_module = Module.concat(web_module, HomeLive)
         admin_live_module = Module.concat(web_module, AdminLive)
         jobs_live_module = Module.concat([web_module, Admin, JobsLive])
         job_show_live_module = Module.concat([web_module, Admin, JobShowLive])
+        users_live_module = Module.concat([web_module, Admin, UsersLive])
+        impersonation_controller_module = Module.concat(web_module, ImpersonationController)
 
         projects_domain_module = Module.concat(prefix, Projects)
         sync_org_tree_worker_module = Module.concat([prefix, Workers, SyncOrgTreeWorker])
@@ -205,7 +212,12 @@ if Code.ensure_loaded?(Igniter) do
         |> setup_oban_config(otp_app, repo_module, cron_entries)
         |> update_ash_domains_config(otp_app, domains_to_add)
         |> create_jobs_context(jobs_module, repo_module, otp_app)
-        |> create_admin_live(admin_live_module, web_module, live_user_auth_module)
+        |> create_admin_live(
+          admin_live_module,
+          web_module,
+          live_user_auth_module,
+          install_users?
+        )
         |> create_jobs_live(jobs_live_module, web_module, live_user_auth_module, jobs_module)
         |> create_job_show_live(
           job_show_live_module,
@@ -213,7 +225,7 @@ if Code.ensure_loaded?(Igniter) do
           live_user_auth_module,
           jobs_module
         )
-        |> update_router(router_module, live_user_auth_module)
+        |> update_router(router_module, live_user_auth_module, install_users?)
         |> then(fn ign ->
           if install_org_tree? do
             ign
@@ -261,6 +273,28 @@ if Code.ensure_loaded?(Igniter) do
           if install_users? do
             ign
             |> patch_user_resource(user_resource_module)
+            |> create_users_live(
+              users_live_module,
+              web_module,
+              live_user_auth_module,
+              accounts_module,
+              user_resource_module
+            )
+            |> patch_users_live(users_live_module)
+            |> create_impersonation_controller(
+              impersonation_controller_module,
+              web_module,
+              prefix
+            )
+            |> patch_live_user_auth_for_impersonation(live_user_auth_module, prefix)
+            |> patch_layouts_for_impersonation(layouts_module)
+            |> patch_layouts_invocations_for_impersonation([
+              home_live_module,
+              admin_live_module,
+              jobs_live_module,
+              job_show_live_module,
+              users_live_module
+            ])
             |> create_sync_employees_worker(
               sync_employees_worker_module,
               prefix,
@@ -380,11 +414,16 @@ if Code.ensure_loaded?(Igniter) do
 
         5. The jobs admin page is at /admin/jobs.
 
-        6. To install spend type sync only:
+        6. With --users, the users admin page is at /admin/users and impersonation
+           routes are available at:
+             POST /admin/impersonation/start/:user_id
+             GET /admin/impersonation/stop
+
+        7. To install spend type sync only:
 
              mix px_imports.install --spend-types
 
-        7. To install month end close sync only:
+        8. To install month end close sync only:
 
              mix px_imports.install --month_close
 
@@ -698,7 +737,13 @@ if Code.ensure_loaded?(Igniter) do
     # Admin LiveViews
     # ──────────────────────────────────────────────
 
-    defp create_admin_live(igniter, admin_live_module, web_module, live_user_auth_module) do
+    defp create_admin_live(
+           igniter,
+           admin_live_module,
+           web_module,
+           live_user_auth_module,
+           include_users?
+         ) do
       jobs_card = ~S"""
               <.link
                 navigate={~p"/admin/jobs"}
@@ -713,6 +758,26 @@ if Code.ensure_loaded?(Igniter) do
               </.link>
       """
 
+      users_card = ~S"""
+              <.link
+                navigate={~p"/admin/users"}
+                class="rounded-xl border border-base-300 p-5 hover:bg-base-200/40 transition-colors"
+              >
+                <div class="flex items-center gap-2 font-semibold">
+                  <.icon name="hero-users" class="w-5 h-5" /> Users
+                </div>
+                <p class="mt-2 text-sm text-base-content/70">
+                  Manage admin access and impersonation.
+                </p>
+              </.link>
+      """
+
+      cards =
+        [jobs_card]
+        |> then(fn list -> if include_users?, do: list ++ [users_card], else: list end)
+        |> Enum.map(&String.trim_trailing/1)
+        |> Enum.join("\n")
+
       full_contents = """
       use #{inspect(web_module)}, :live_view
 
@@ -726,7 +791,12 @@ if Code.ensure_loaded?(Igniter) do
       @impl true
       def render(assigns) do
         ~H\"\"\"
-        <Layouts.app flash={@flash} current_user={@current_user}>
+        <Layouts.app
+          flash={@flash}
+          current_user={@current_user}
+          current_path={assigns[:current_path] || "/"}
+          impersonator={assigns[:impersonator]}
+        >
           <div class="mx-auto max-w-3xl">
             <h1 class="text-4xl font-bold">Admin Dashboard</h1>
             <p class="mt-3 text-base-content/70">
@@ -734,7 +804,7 @@ if Code.ensure_loaded?(Igniter) do
             </p>
 
             <div class="mt-8 grid gap-4 sm:grid-cols-2">
-      #{String.trim_trailing(jobs_card)}
+      #{cards}
             </div>
           </div>
         </Layouts.app>
@@ -754,7 +824,10 @@ if Code.ensure_loaded?(Igniter) do
             Igniter.update_file(igniter, path, fn source ->
               content = Rewrite.Source.get(source, :content)
 
-              if String.contains?(content, ~s|navigate={~p"/admin/jobs"}|) do
+              has_jobs_card? = String.contains?(content, ~s|navigate={~p"/admin/jobs"}|)
+              has_users_card? = String.contains?(content, ~s|navigate={~p"/admin/users"}|)
+
+              if has_jobs_card? and (not include_users? or has_users_card?) do
                 source
               else
                 # Replace the render function body with one that includes the jobs card.
@@ -765,7 +838,12 @@ if Code.ensure_loaded?(Igniter) do
                     fn _, open, _old_body, close, _ ->
                       new_body = """
 
-                      <Layouts.app flash={@flash} current_user={@current_user}>
+                      <Layouts.app
+                        flash={@flash}
+                        current_user={@current_user}
+                        current_path={assigns[:current_path] || "/"}
+                        impersonator={assigns[:impersonator]}
+                      >
                         <div class="mx-auto max-w-3xl">
                           <h1 class="text-4xl font-bold">Admin Dashboard</h1>
                           <p class="mt-3 text-base-content/70">
@@ -773,7 +851,7 @@ if Code.ensure_loaded?(Igniter) do
                           </p>
 
                           <div class="mt-8 grid gap-4 sm:grid-cols-2">
-                      #{String.trim_trailing(jobs_card)}
+                      #{cards}
                           </div>
                         </div>
                       </Layouts.app>
@@ -791,7 +869,7 @@ if Code.ensure_loaded?(Igniter) do
           {:error, igniter} ->
             Igniter.add_warning(
               igniter,
-              "Could not find #{inspect(admin_live_module)} to patch. Jobs card not added."
+              "Could not find #{inspect(admin_live_module)} to patch. Admin cards not added."
             )
         end
       else
@@ -850,7 +928,12 @@ if Code.ensure_loaded?(Igniter) do
         @impl true
         def render(assigns) do
           ~H\"\"\"
-          <Layouts.app flash={@flash} current_user={@current_user}>
+          <Layouts.app
+            flash={@flash}
+            current_user={@current_user}
+            current_path={assigns[:current_path] || "/"}
+            impersonator={assigns[:impersonator]}
+          >
             <div class="space-y-10">
               <section>
                 <.header>
@@ -992,7 +1075,12 @@ if Code.ensure_loaded?(Igniter) do
         @impl true
         def render(assigns) do
           ~H\"\"\"
-          <Layouts.app flash={@flash} current_user={@current_user}>
+          <Layouts.app
+            flash={@flash}
+            current_user={@current_user}
+            current_path={assigns[:current_path] || "/"}
+            impersonator={assigns[:impersonator]}
+          >
             <div class="space-y-8">
               <div class="flex items-center justify-between gap-4">
                 <div>
@@ -1282,11 +1370,884 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp create_users_live(
+           igniter,
+           users_live_module,
+           web_module,
+           live_user_auth_module,
+           accounts_module,
+           user_module
+         ) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, users_live_module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use #{inspect(web_module)}, :live_view
+
+        require Ash.Query
+        require Ash.Expr
+
+        alias #{inspect(accounts_module)}, as: Accounts
+        alias #{inspect(user_module)}, as: User
+
+        on_mount {#{inspect(live_user_auth_module)}, :live_admin_required}
+
+        @per_page 25
+
+        @impl true
+        def mount(_params, _session, socket) do
+          {:ok, socket}
+        end
+
+        @impl true
+        def handle_params(params, _uri, socket) do
+          page = parse_page(Map.get(params, "page"))
+          q = params |> Map.get("q", "") |> to_string() |> String.trim()
+          show_inactive = parse_bool(Map.get(params, "show_inactive"))
+          filter_form = to_form(%{"q" => q, "show_inactive" => show_inactive}, as: :filter)
+
+          socket =
+            socket
+            |> assign(
+              page: page,
+              search_q: q,
+              show_inactive: show_inactive,
+              filter_form: filter_form
+            )
+            |> load_users_page()
+
+          {:noreply, socket}
+        end
+
+        @impl true
+        def handle_event("search", %{"filter" => filter_params}, socket) do
+          q = filter_params |> Map.get("q", "") |> to_string() |> String.trim()
+          show_inactive = parse_bool(Map.get(filter_params, "show_inactive"))
+
+          {:noreply, push_patch(socket, to: users_patch_path(1, q, show_inactive))}
+        end
+
+        def handle_event("search", _params, socket) do
+          {:noreply, push_patch(socket, to: users_patch_path(1, socket.assigns.search_q, false))}
+        end
+
+        @impl true
+        def handle_event("ignore_search_submit", _params, socket) do
+          {:noreply, socket}
+        end
+
+        @impl true
+        def handle_event("toggle_admin", %{"id" => id}, socket) do
+          user = Enum.find(socket.assigns.users, &(to_string(&1.id) == id))
+
+          case user do
+            nil ->
+              {:noreply, put_flash(socket, :error, "User not found on this page")}
+
+            user ->
+              user
+              |> Ash.Changeset.for_update(:set_admin, %{is_admin: !user.is_admin},
+                actor: socket.assigns.current_user
+              )
+              |> Ash.update(domain: Accounts, actor: socket.assigns.current_user, authorize?: false)
+              |> case do
+                {:ok, _updated_user} ->
+                  {:noreply, socket |> put_flash(:info, "Admin flag updated") |> load_users_page()}
+
+                {:error, reason} ->
+                  {:noreply, put_flash(socket, :error, "Failed to update admin flag: \#{inspect(reason)}")}
+              end
+          end
+        end
+
+        defp load_users_page(socket) do
+          page = socket.assigns.page
+          q = socket.assigns.search_q
+          show_inactive = socket.assigns.show_inactive
+
+          query =
+            User
+            |> Ash.Query.for_read(:list_for_admin)
+            |> maybe_filter_active(show_inactive)
+            |> maybe_filter_search(q)
+            |> Ash.Query.sort(:email)
+            |> Ash.Query.page(limit: @per_page, offset: (page - 1) * @per_page, count: true)
+
+          %Ash.Page.Offset{
+            results: users,
+            count: total,
+            limit: limit,
+            offset: offset
+          } = Ash.read!(query, domain: Accounts, authorize?: false)
+
+          more? = offset + length(users) < total
+
+          assign(socket,
+            users: users,
+            users_total: total,
+            users_limit: limit,
+            users_offset: offset,
+            users_more?: more?
+          )
+        end
+
+        defp maybe_filter_search(query, ""), do: query
+
+        defp maybe_filter_search(query, term) do
+          Ash.Query.filter(
+            query,
+            Ash.Expr.expr(
+              contains(email, ^term) or
+                (not is_nil(given_name) and contains(given_name, ^term)) or
+                (not is_nil(family_name) and contains(family_name, ^term))
+            )
+          )
+        end
+
+        defp maybe_filter_active(query, true), do: query
+
+        defp maybe_filter_active(query, false) do
+          Ash.Query.filter(query, Ash.Expr.expr(is_nil(hidden_at)))
+        end
+
+        defp parse_page(nil), do: 1
+        defp parse_page(""), do: 1
+
+        defp parse_page(str) do
+          case Integer.parse(to_string(str)) do
+            {n, _} when n > 0 -> n
+            _ -> 1
+          end
+        end
+
+        defp parse_bool(value), do: value in [true, "true", "on", "1", 1]
+
+        defp users_patch_path(page, q, show_inactive) do
+          pairs =
+            []
+            |> then(fn acc -> if page > 1, do: [{"page", Integer.to_string(page)} | acc], else: acc end)
+            |> then(fn acc -> if q != "", do: [{"q", q} | acc], else: acc end)
+            |> then(fn acc ->
+              if show_inactive, do: [{"show_inactive", "true"} | acc], else: acc
+            end)
+
+          base = ~p"/admin/users"
+
+          case pairs do
+            [] -> base
+            _ -> base <> "?" <> URI.encode_query(pairs)
+          end
+        end
+
+        defp range_label(offset, total, shown) do
+          start_i = offset + 1
+          end_i = offset + shown
+
+          cond do
+            total == 0 ->
+              "No users"
+
+            shown == 0 ->
+              "No users on this page"
+
+            true ->
+              "\#{start_i}-\#{end_i} of \#{total}"
+          end
+        end
+
+        defp join_date_label(nil), do: "—"
+        defp join_date_label(%Date{} = date), do: Date.to_iso8601(date)
+
+        defp hidden_at_title(nil), do: ""
+        defp hidden_at_title(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+        defp hidden_at_title(%NaiveDateTime{} = datetime), do: NaiveDateTime.to_iso8601(datetime)
+        defp hidden_at_title(%Date{} = date), do: Date.to_iso8601(date)
+        defp hidden_at_title(value), do: to_string(value)
+
+        @impl true
+        def render(assigns) do
+          assigns =
+            assign(
+              assigns,
+              :range_label,
+              range_label(assigns.users_offset, assigns.users_total, length(assigns.users))
+            )
+
+          ~H\"\"\"
+          <Layouts.app
+            flash={@flash}
+            current_user={@current_user}
+            current_path={assigns[:current_path] || "/"}
+            impersonator={assigns[:impersonator]}
+          >
+            <.header>
+              Users
+              <:subtitle>Manage admin access and impersonation.</:subtitle>
+            </.header>
+
+            <div class="flex flex-col gap-4 mb-4">
+              <.form
+                for={@filter_form}
+                phx-change="search"
+                phx-submit="ignore_search_submit"
+                class="flex flex-wrap items-end gap-3"
+              >
+                <div class="flex-1 min-w-[12rem] max-w-md">
+                  <.input
+                    field={@filter_form[:q]}
+                    type="search"
+                    label="Search"
+                    placeholder="Email or name..."
+                    phx-debounce="300"
+                  />
+                </div>
+                <.input
+                  field={@filter_form[:show_inactive]}
+                  type="checkbox"
+                  label="Show inactive users"
+                />
+                <.link
+                  :if={@search_q != ""}
+                  patch={users_patch_path(1, "", @show_inactive)}
+                  class="btn btn-ghost btn-sm"
+                >
+                  Clear
+                </.link>
+              </.form>
+
+              <div class="text-sm text-base-content/70 flex flex-wrap items-center justify-between gap-2">
+                <span>{@range_label}</span>
+                <div class="join">
+                  <%= if @page <= 1 do %>
+                    <span class="join-item btn btn-sm btn-disabled">Previous</span>
+                  <% else %>
+                    <.link
+                      patch={users_patch_path(@page - 1, @search_q, @show_inactive)}
+                      class="join-item btn btn-sm"
+                    >
+                      Previous
+                    </.link>
+                  <% end %>
+
+                  <button type="button" class="join-item btn btn-sm btn-ghost no-animation">
+                    Page {@page}
+                  </button>
+
+                  <%= if @users_more? do %>
+                    <.link
+                      patch={users_patch_path(@page + 1, @search_q, @show_inactive)}
+                      class="join-item btn btn-sm"
+                    >
+                      Next
+                    </.link>
+                  <% else %>
+                    <span class="join-item btn btn-sm btn-disabled">Next</span>
+                  <% end %>
+                </div>
+              </div>
+            </div>
+
+            <div class="overflow-x-auto rounded-xl border border-base-300">
+              <table class="table w-full">
+                <thead>
+                  <tr>
+                    <th>Email</th>
+                    <th>Name</th>
+                    <th>Admin</th>
+                    <th>Category</th>
+                    <th>Join date</th>
+                    <th class="text-right">Impersonate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :if={@users == []}>
+                    <td colspan="6" class="text-center text-base-content/60 py-8">
+                      <%= if @search_q != "" do %>
+                        No users match this search.
+                      <% else %>
+                        No users yet.
+                      <% end %>
+                    </td>
+                  </tr>
+                  <tr :for={user <- @users}>
+                    <td>
+                      <span class="font-medium">{user.email}</span>
+                    </td>
+                    <td>{user.given_name} {user.family_name}</td>
+                    <td>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span :if={user.is_admin} class="badge badge-primary">Admin</span>
+                        <span :if={!user.is_admin} class="text-base-content/50">—</span>
+                        <.button
+                          :if={!user.is_admin}
+                          phx-click="toggle_admin"
+                          phx-value-id={user.id}
+                          class="btn btn-xs btn-ghost"
+                        >
+                          Grant admin
+                        </.button>
+                        <.button
+                          :if={user.is_admin and user.id != @current_user.id}
+                          phx-click="toggle_admin"
+                          phx-value-id={user.id}
+                          class="btn btn-xs btn-error"
+                        >
+                          Revoke admin
+                        </.button>
+                      </div>
+                    </td>
+                    <td>{user.category_name || user.category || "—"}</td>
+                    <td>
+                      <div class="flex flex-col gap-1">
+                        <span>{join_date_label(user.join_date)}</span>
+                        <span
+                          :if={!is_nil(user.hidden_at)}
+                          class="text-xs font-medium text-warning"
+                          title={hidden_at_title(user.hidden_at)}
+                        >
+                          Inactive
+                        </span>
+                      </div>
+                    </td>
+                    <td class="text-right">
+                      <.form for={%{}} action={~p"/admin/impersonation/start/\#{user.id}"} method="post">
+                        <input
+                          type="hidden"
+                          name="_csrf_token"
+                          value={Plug.CSRFProtection.get_csrf_token()}
+                        />
+                        <button type="submit" class="btn btn-xs btn-outline">
+                          Impersonate
+                        </button>
+                      </.form>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </Layouts.app>
+          \"\"\"
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, users_live_module, contents)
+      end
+    end
+
+    defp patch_users_live(igniter, users_live_module) do
+      case Igniter.Project.Module.find_module(igniter, users_live_module) do
+        {:ok, {igniter, source, _zipper}} ->
+          path = Rewrite.Source.get(source, :path)
+
+          Igniter.update_file(igniter, path, fn source ->
+            content = Rewrite.Source.get(source, :content)
+
+            content =
+              String.replace(
+                content,
+                ~S'<.link navigate={~p"/users/#{user.id}"} class="font-medium link link-hover">
+                        {user.email}
+                      </.link>',
+                ~S'<span class="font-medium">{user.email}</span>'
+              )
+
+            Rewrite.Source.update(source, :content, content)
+          end)
+
+        {:error, igniter} ->
+          igniter
+      end
+    end
+
+    defp create_impersonation_controller(igniter, module, web_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        user_module = Module.concat([prefix, Accounts, User])
+        accounts_module = Module.concat(prefix, Accounts)
+
+        contents = """
+        @moduledoc \"\"\"
+        Controller for admin impersonation. Admins can start impersonating another
+        user for the duration of their session and stop at any time.
+        \"\"\"
+
+        use #{inspect(web_module)}, :controller
+
+        alias #{inspect(user_module)}, as: User
+        alias #{inspect(accounts_module)}, as: Accounts
+
+        def start(conn, %{"user_id" => user_id}) do
+          with %User{is_admin: true} = admin <- conn.assigns[:current_user],
+               %User{} = target <- safe_get_user(user_id) do
+            conn
+            |> store_user_in_session(target)
+            |> put_session(:impersonator_id, admin.id)
+            |> put_flash(:info, "Now impersonating \#{target.email}")
+            |> redirect(to: ~p"/")
+          else
+            _ ->
+              conn
+              |> put_flash(:error, "Unable to impersonate that user")
+              |> redirect(to: ~p"/admin")
+          end
+        end
+
+        def stop(conn, params) do
+          return_to = safe_return_to(params["return_to"])
+
+          case get_session(conn, :impersonator_id) do
+            nil ->
+              conn
+              |> put_flash(:info, "You are not currently impersonating anyone")
+              |> redirect(to: return_to || ~p"/")
+
+            admin_id ->
+              case safe_get_user(admin_id) do
+                %User{} = admin ->
+                  conn
+                  |> delete_session(:impersonator_id)
+                  |> store_user_in_session(admin)
+                  |> put_flash(:info, "Stopped impersonating")
+                  |> redirect(to: return_to || ~p"/admin")
+
+                _ ->
+                  conn
+                  |> delete_session(:impersonator_id)
+                  |> redirect(to: ~p"/sign-in")
+              end
+          end
+        end
+
+        defp safe_return_to(path) when is_binary(path) do
+          cond do
+            String.starts_with?(path, "/admin/impersonation") -> nil
+            String.match?(path, ~r{\\A/[^/\\\\]}) -> path
+            path == "/" -> path
+            true -> nil
+          end
+        end
+
+        defp safe_return_to(_), do: nil
+
+        defp store_user_in_session(conn, user) do
+          {:ok, token, _claims} =
+            AshAuthentication.Jwt.token_for_user(user, %{"purpose" => "user"})
+
+          user_with_token = put_in(user.__metadata__[:token], token)
+
+          AshAuthentication.Plug.Helpers.store_in_session(conn, user_with_token)
+        end
+
+        defp safe_get_user(id) do
+          Ash.get(User, id, domain: Accounts, authorize?: false)
+          |> case do
+            {:ok, user} -> user
+            _ -> nil
+          end
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp patch_live_user_auth_for_impersonation(igniter, live_user_auth_module, prefix) do
+      case Igniter.Project.Module.find_module(igniter, live_user_auth_module) do
+        {:ok, {igniter, source, _zipper}} ->
+          path = Rewrite.Source.get(source, :path)
+          accounts_module = Module.concat(prefix, Accounts)
+          user_module = Module.concat([prefix, Accounts, User])
+
+          Igniter.update_file(igniter, path, fn source ->
+            content = Rewrite.Source.get(source, :content)
+
+            content =
+              content
+              |> ensure_current_user_mount_impersonation()
+              |> ensure_live_user_auth_helpers(accounts_module, user_module)
+
+            Rewrite.Source.update(source, :content, content)
+          end)
+
+        {:error, igniter} ->
+          Igniter.add_warning(
+            igniter,
+            "Could not find #{inspect(live_user_auth_module)}. Impersonation mount wiring skipped."
+          )
+      end
+    end
+
+    defp ensure_current_user_mount_impersonation(content) do
+      has_path? = String.contains?(content, "attach_path_hook()")
+      has_impersonator? = String.contains?(content, "attach_impersonator(session)")
+
+      if has_path? and has_impersonator? do
+        content
+      else
+        append_lines =
+          []
+          |> then(fn acc ->
+            if has_path?, do: acc, else: acc ++ ["      |> attach_path_hook()"]
+          end)
+          |> then(fn acc ->
+            if has_impersonator?,
+              do: acc,
+              else: acc ++ ["      |> attach_impersonator(session)"]
+          end)
+
+        append_pipeline =
+          case append_lines do
+            [] -> ""
+            lines -> "\n" <> Enum.join(lines, "\n")
+          end
+
+        updated =
+          Regex.replace(
+            ~r/(\|>\s*AshAuthentication\.Phoenix\.LiveSession\.assign_new_resources\(session\))/,
+            content,
+            &(&1 <> append_pipeline),
+            global: false
+          )
+
+        updated
+        |> then(fn updated ->
+          if updated != content do
+            updated
+          else
+            String.replace(
+              updated,
+              "{:cont, AshAuthentication.Phoenix.LiveSession.assign_new_resources(socket, session)}",
+              """
+                  {:cont,
+                   socket
+                   |> AshAuthentication.Phoenix.LiveSession.assign_new_resources(session)#{append_pipeline}}
+              """,
+              global: false
+            )
+          end
+        end)
+      end
+    end
+
+    defp ensure_live_user_auth_helpers(content, accounts_module, user_module) do
+      content
+      |> then(fn c ->
+        if String.contains?(c, "defp attach_path_hook(socket)") do
+          c
+        else
+          append_before_module_end(
+            c,
+            """
+
+              defp attach_path_hook(socket) do
+                Phoenix.LiveView.attach_hook(
+                  socket,
+                  :active_path,
+                  :handle_params,
+                  fn _params, url, socket ->
+                    path =
+                      case URI.parse(url) do
+                        %URI{path: nil} -> "/"
+                        %URI{path: path} -> path
+                      end
+
+                    {:cont, Phoenix.Component.assign(socket, :current_path, path)}
+                  end
+                )
+              rescue
+                _ -> socket
+              end
+            """
+          )
+        end
+      end)
+      |> then(fn c ->
+        if String.contains?(c, "defp attach_impersonator(socket, session)") do
+          c
+        else
+          append_before_module_end(
+            c,
+            """
+
+              defp attach_impersonator(socket, session) do
+                case session["impersonator_id"] do
+                  nil ->
+                    Phoenix.Component.assign_new(socket, :impersonator, fn -> nil end)
+
+                  id ->
+                    impersonator =
+                      try do
+                        Ash.get!(#{inspect(user_module)}, id,
+                          domain: #{inspect(accounts_module)},
+                          authorize?: false
+                        )
+                      rescue
+                        _ -> nil
+                      end
+
+                    Phoenix.Component.assign(socket, :impersonator, impersonator)
+                end
+              end
+            """
+          )
+        end
+      end)
+    end
+
+    defp patch_layouts_for_impersonation(igniter, layouts_module) do
+      case Igniter.Project.Module.find_module(igniter, layouts_module) do
+        {:ok, {igniter, source, _zipper}} ->
+          path = Rewrite.Source.get(source, :path)
+
+          Igniter.update_file(igniter, path, fn source ->
+            content = Rewrite.Source.get(source, :content)
+
+            content =
+              content
+              |> ensure_layout_attrs_for_impersonation()
+              |> ensure_layout_impersonation_banner_render()
+              |> ensure_layout_impersonation_banner_fn()
+
+            Rewrite.Source.update(source, :content, content)
+          end)
+
+        {:error, igniter} ->
+          Igniter.add_warning(
+            igniter,
+            "Could not find #{inspect(layouts_module)}. Impersonation banner wiring skipped."
+          )
+      end
+    end
+
+    defp ensure_layout_attrs_for_impersonation(content) do
+      content
+      |> then(fn c ->
+        if String.contains?(c, "attr :current_path, :string") do
+          c
+        else
+          c
+          |> String.replace(
+            ~S'attr :current_user, :map, default: nil, doc: "the current authenticated user"',
+            ~S'attr :current_user, :map, default: nil, doc: "the current authenticated user"' <>
+              "\n" <>
+              ~S'  attr :current_path, :string, default: "/", doc: "the active URL path for nav highlighting"',
+            global: false
+          )
+          |> then(fn maybe_changed ->
+            if maybe_changed != c do
+              maybe_changed
+            else
+              String.replace(
+                c,
+                ~S'attr :flash, :map, required: true, doc: "the map of flash messages"',
+                ~S'attr :flash, :map, required: true, doc: "the map of flash messages"' <>
+                  "\n" <>
+                  ~S'  attr :current_path, :string, default: "/", doc: "the active URL path for nav highlighting"',
+                global: false
+              )
+            end
+          end)
+        end
+      end)
+      |> then(fn c ->
+        if String.contains?(c, "attr :impersonator, :map") do
+          c
+        else
+          c
+          |> String.replace(
+            ~S'attr :current_path, :string, default: "/", doc: "the active URL path for nav highlighting"',
+            ~S'attr :current_path, :string, default: "/", doc: "the active URL path for nav highlighting"' <>
+              "\n" <>
+              ~S'  attr :impersonator, :map, default: nil, doc: "admin user currently impersonating, if any"',
+            global: false
+          )
+          |> then(fn maybe_changed ->
+            if maybe_changed != c do
+              maybe_changed
+            else
+              String.replace(
+                c,
+                ~S'attr :current_user, :map, default: nil, doc: "the current authenticated user"',
+                ~S'attr :current_user, :map, default: nil, doc: "the current authenticated user"' <>
+                  "\n" <>
+                  ~S'  attr :impersonator, :map, default: nil, doc: "admin user currently impersonating, if any"',
+                global: false
+              )
+            end
+          end)
+        end
+      end)
+    end
+
+    defp ensure_layout_impersonation_banner_render(content) do
+      content =
+        String.replace(
+          content,
+          """
+          <.impersonation_banner
+            :if={@impersonator}
+            impersonator={@impersonator}
+            current_user={@current_user}
+            current_path={@current_path}
+          />
+
+          """,
+          """
+              <.impersonation_banner
+                :if={@impersonator}
+                impersonator={@impersonator}
+                current_user={@current_user}
+                current_path={@current_path}
+              />
+
+          """
+        )
+
+      if String.contains?(content, "<.impersonation_banner") do
+        content
+      else
+        banner_render =
+          [
+            "    <.impersonation_banner",
+            "      :if={@impersonator}",
+            "      impersonator={@impersonator}",
+            "      current_user={@current_user}",
+            "      current_path={@current_path}",
+            "    />",
+            ""
+          ]
+          |> Enum.join("\n")
+
+        Regex.replace(
+          ~r/(def app\(assigns\) do\s*\n\s*~H"""\n)/,
+          content,
+          fn _, opener ->
+            opener <> banner_render
+          end,
+          global: false
+        )
+      end
+    end
+
+    defp ensure_layout_impersonation_banner_fn(content) do
+      if String.contains?(content, "defp impersonation_banner(assigns)") do
+        content
+      else
+        banner_fn = """
+          attr :impersonator, :map, required: true
+          attr :current_user, :map, required: true
+          attr :current_path, :string, default: "/"
+
+          defp impersonation_banner(assigns) do
+            ~H\"\"\"
+            <div class="border-b border-warning/35 bg-warning/12 text-base-content">
+              <div class="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6 lg:px-8">
+                <span>
+                  Impersonating <strong>{@current_user.email}</strong>
+                  as <strong>{@impersonator.email}</strong>
+                </span>
+                <.link
+                  href={~p"/admin/impersonation/stop?\#{[return_to: @current_path]}"}
+                  class="btn btn-xs btn-outline border-warning/40"
+                >
+                  Stop impersonating
+                </.link>
+              </div>
+            </div>
+            \"\"\"
+          end
+
+        """
+
+        if String.contains?(content, ~S'@doc """
+  Shows the flash group with standard titles and content.') do
+          String.replace(
+            content,
+            ~S'@doc """
+  Shows the flash group with standard titles and content.',
+            banner_fn <>
+              ~S'@doc """
+  Shows the flash group with standard titles and content.',
+            global: false
+          )
+        else
+          append_before_module_end(content, "\n" <> banner_fn)
+        end
+      end
+    end
+
+    defp patch_layouts_invocations_for_impersonation(igniter, modules) do
+      Enum.reduce(modules, igniter, fn module, acc ->
+        patch_module_layouts_invocation_for_impersonation(acc, module)
+      end)
+    end
+
+    defp patch_module_layouts_invocation_for_impersonation(igniter, module) do
+      case Igniter.Project.Module.find_module(igniter, module) do
+        {:ok, {igniter, source, _zipper}} ->
+          path = Rewrite.Source.get(source, :path)
+
+          Igniter.update_file(igniter, path, fn source ->
+            content = Rewrite.Source.get(source, :content)
+
+            if not String.contains?(content, "<Layouts.app") or
+                 String.contains?(content, "impersonator={assigns[:impersonator]}") do
+              source
+            else
+              new_content = patch_layouts_app_opening(content)
+
+              Rewrite.Source.update(source, :content, new_content)
+            end
+          end)
+
+        {:error, igniter} ->
+          igniter
+      end
+    end
+
+    defp patch_layouts_app_opening(content) do
+      Regex.replace(
+        ~r/<Layouts\.app(?<attrs>[\s\S]*?)>/,
+        content,
+        fn _match, attrs ->
+          additions =
+            []
+            |> then(fn lines ->
+              if String.contains?(attrs, "current_path=") do
+                lines
+              else
+                lines ++ ["\n            current_path={assigns[:current_path] || \"/\"}"]
+              end
+            end)
+            |> then(fn lines ->
+              if String.contains?(attrs, "impersonator=") do
+                lines
+              else
+                lines ++ ["\n            impersonator={assigns[:impersonator]}"]
+              end
+            end)
+            |> Enum.join("")
+
+          "<Layouts.app" <> attrs <> additions <> ">"
+        end,
+        global: false
+      )
+    end
+
+    defp append_before_module_end(content, code) do
+      Regex.replace(~r/\nend\s*$/, content, code <> "\nend", global: false)
+    end
+
     # ──────────────────────────────────────────────
     # Router: admin routes + oban dashboard
     # ──────────────────────────────────────────────
 
-    defp update_router(igniter, router_module, live_user_auth_module) do
+    defp update_router(igniter, router_module, live_user_auth_module, include_users?) do
       live_user_auth_str = inspect(live_user_auth_module)
 
       case Igniter.Project.Module.find_module(igniter, router_module) do
@@ -1300,6 +2261,10 @@ if Code.ensure_loaded?(Igniter) do
               content
               |> add_oban_web_import()
               |> add_admin_routes(live_user_auth_str)
+              |> then(fn c ->
+                if include_users?, do: add_users_admin_route(c, live_user_auth_str), else: c
+              end)
+              |> then(fn c -> if include_users?, do: add_impersonation_routes(c), else: c end)
               |> add_oban_dashboard()
 
             Rewrite.Source.update(source, :content, content)
@@ -1366,6 +2331,66 @@ if Code.ensure_loaded?(Igniter) do
           true ->
             content <> "\n" <> admin_session_block
         end
+      end
+    end
+
+    defp add_users_admin_route(content, live_user_auth_str) do
+      if String.contains?(content, ~s|live "/admin/users"|) do
+        content
+      else
+        admin_session_block = """
+            ash_authentication_live_session :admin_routes,
+              on_mount: [{#{live_user_auth_str}, :current_user}] do
+              live "/admin", AdminLive
+              live "/admin/users", Admin.UsersLive
+            end
+        """
+
+        cond do
+          String.contains?(content, ":admin_routes") ->
+            Regex.replace(
+              ~r/(ash_authentication_live_session\s+:admin_routes\b.*?)(^\s+end)/ms,
+              content,
+              fn _, block, ending ->
+                block <> "      live \"/admin/users\", Admin.UsersLive\n" <> ending
+              end,
+              global: false
+            )
+
+          String.contains?(content, ":authenticated_routes") ->
+            Regex.replace(
+              ~r/(ash_authentication_live_session\s+:authenticated_routes\b.*?end\n)/s,
+              content,
+              fn _, block -> block <> "\n" <> admin_session_block end,
+              global: false
+            )
+
+          true ->
+            content <> "\n" <> admin_session_block
+        end
+      end
+    end
+
+    defp add_impersonation_routes(content) do
+      content
+      |> add_route_after_sign_out(
+        ~s|post "/admin/impersonation/start/:user_id", ImpersonationController, :start|
+      )
+      |> add_route_after_sign_out(
+        ~s|get "/admin/impersonation/stop", ImpersonationController, :stop|
+      )
+    end
+
+    defp add_route_after_sign_out(content, route_line) do
+      if String.contains?(content, route_line) do
+        content
+      else
+        Regex.replace(
+          ~r/(^\s*sign_out_route AuthController[^\n]*\n)/m,
+          content,
+          fn match -> match <> "    " <> route_line <> "\n" end,
+          global: false
+        )
       end
     end
 
@@ -2233,6 +3258,30 @@ if Code.ensure_loaded?(Igniter) do
         end
         """
       )
+      |> Ash.Resource.Igniter.add_new_action(
+        user_module,
+        :list_for_admin,
+        """
+        read :list_for_admin do
+          description "Paginated directory for the admin users screen"
+
+          pagination offset?: true,
+                     default_limit: 25,
+                     max_page_size: 100,
+                     required?: true,
+                     countable: true
+        end
+        """
+      )
+      |> Ash.Resource.Igniter.add_new_action(
+        user_module,
+        :set_admin,
+        """
+        update :set_admin do
+          accept [:is_admin]
+        end
+        """
+      )
     end
 
     defp create_sync_employees_worker(igniter, module, prefix, user_module) do
@@ -2461,7 +3510,7 @@ if Code.ensure_loaded?(Igniter) do
         defp parse_start_date(nil), do: nil
 
         defp parse_start_date(date_string) when is_binary(date_string) do
-          Date.from_iso8601!(date_string)
+          parse_iso8601_date(date_string)
         end
 
         defp parse_start_date(_), do: nil
@@ -2496,12 +3545,9 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp maybe_put_join_date(attrs, user, employee) do
-          case {user.join_date, employee["start_date"]} do
-            {nil, start_date} when is_binary(start_date) ->
-              Map.put(attrs, :join_date, Date.from_iso8601!(start_date))
-
-            _ ->
-              attrs
+          case {user.join_date, parse_start_date(employee["start_date"])} do
+            {nil, %Date{} = start_date} -> Map.put(attrs, :join_date, start_date)
+            _ -> attrs
           end
         end
 
@@ -2548,10 +3594,40 @@ if Code.ensure_loaded?(Igniter) do
         defp parse_termination_date(nil), do: nil
 
         defp parse_termination_date(date_string) when is_binary(date_string) do
-          date_string
-          |> Date.from_iso8601!()
-          |> DateTime.new!(~T[00:00:00], "Etc/UTC")
+          case parse_iso8601_date(date_string) do
+            %Date{} = date -> DateTime.new!(date, ~T[00:00:00], "Etc/UTC")
+            nil -> nil
+          end
         end
+
+        defp parse_termination_date(_), do: nil
+
+        defp parse_iso8601_date(value) when is_binary(value) do
+          trimmed = String.trim(value)
+
+          if trimmed == "" do
+            nil
+          else
+            case Date.from_iso8601(trimmed) do
+              {:ok, date} ->
+                date
+
+              {:error, _} ->
+                case DateTime.from_iso8601(trimmed) do
+                  {:ok, datetime, _offset} ->
+                    DateTime.to_date(datetime)
+
+                  {:error, _} ->
+                    case NaiveDateTime.from_iso8601(trimmed) do
+                      {:ok, naive_datetime} -> NaiveDateTime.to_date(naive_datetime)
+                      {:error, _} -> nil
+                    end
+                end
+            end
+          end
+        end
+
+        defp parse_iso8601_date(_), do: nil
 
         defp parse_integer_field(nil), do: nil
         defp parse_integer_field(value) when is_integer(value), do: value
