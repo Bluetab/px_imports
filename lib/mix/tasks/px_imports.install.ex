@@ -7,8 +7,10 @@ if Code.ensure_loaded?(Igniter) do
 
     ## Prerequisites
 
-    - Project created with `ash_authentication_phoenix` and `bluetab_phoenix`
+    - Project created with `ash_authentication_phoenix` and `bluetab_phoenix` (includes `bds`)
     - `:oban` and `:oban_web` must already be in your `mix.exs` dependencies
+    - Admin UI uses Bluetab Design System (`bt_*` components); installer adds
+      `import Bds.Components.CatalogUi` when missing
 
     ## What is always generated
 
@@ -32,6 +34,9 @@ if Code.ensure_loaded?(Igniter) do
       * `--spend-types` — generates `<App>.Projects.SpendType` Ash resource
         plus `SyncSpendTypesWorker` (daily at 02:45)
 
+      * `--hour-types` — generates `<App>.Projects.HourType` Ash resource
+        plus `SyncHourTypesWorker` (daily at 02:47)
+
       * `--month_close` — generates `<App>.Projects.MonthEndClose` Ash resource
         plus `SyncMonthEndCloseWorker` (daily at 02:50)
 
@@ -39,13 +44,18 @@ if Code.ensure_loaded?(Igniter) do
         `<App>.Projects.PositionRelationship` Ash resources plus
         `SyncPositionsWorker` (daily at 02:55)
 
+      * `--holidays` — generates `<App>.Projects.Holiday` Ash resource
+        plus `SyncHolidaysWorker` (daily at 02:58), flattening SuccessFactors
+        holiday calendars into holiday rows with `calendar_code`.
+
       * `--users` — patches `Accounts.User` with PX employee fields (see generated
         resource), `:provision_from_employee_sync`, `:sync_employee_fields`,
         `:list_for_admin`, `:set_admin`, and `SyncEmployeesWorker` (daily at 02:00).
         Also generates `/admin/users` (`Admin.UsersLive`) and complete impersonation
         flow (`ImpersonationController` + banner wiring in `LiveUserAuth`/`Layouts`).
         Sync creates users when an employee email is not yet present. Stores PX
-        `category` and `category_name` as strings only (no separate Catalog domain).
+        `category`, `category_name`, and `hub` as strings only
+        (no separate Catalog domain).
 
         If this installer was already run with `--users`, Ash Igniter skips
         attributes and actions that already exist and does not overwrite an
@@ -57,8 +67,10 @@ if Code.ensure_loaded?(Igniter) do
         mix px_imports.install --org-tree
         mix px_imports.install --users
         mix px_imports.install --spend-types
+        mix px_imports.install --hour-types
         mix px_imports.install --month_close
         mix px_imports.install --positions
+        mix px_imports.install --holidays
         mix px_imports.install --org-tree --users
     """
 
@@ -73,8 +85,10 @@ if Code.ensure_loaded?(Igniter) do
           users: :boolean,
           org_tree: :boolean,
           spend_types: :boolean,
+          hour_types: :boolean,
           month_close: :boolean,
-          positions: :boolean
+          positions: :boolean,
+          holidays: :boolean
         ]
       }
     end
@@ -85,20 +99,24 @@ if Code.ensure_loaded?(Igniter) do
       install_org_tree? = Keyword.get(opts, :org_tree, false)
       install_users? = Keyword.get(opts, :users, false)
       install_spend_types? = Keyword.get(opts, :spend_types, false)
+      install_hour_types? = Keyword.get(opts, :hour_types, false)
       install_month_close? = Keyword.get(opts, :month_close, false)
       install_positions? = Keyword.get(opts, :positions, false)
+      install_holidays? = Keyword.get(opts, :holidays, false)
 
-      if not (install_org_tree? or install_users? or install_spend_types? or install_month_close? or
-                install_positions?) do
+      if not (install_org_tree? or install_users? or install_spend_types? or install_hour_types? or
+                install_month_close? or install_positions? or install_holidays?) do
         Igniter.add_issue(igniter, """
-        At least one of --org-tree, --users, --spend-types, --month_close, or --positions must be specified.
+        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, or --holidays must be specified.
 
         Examples:
           mix px_imports.install --org-tree
           mix px_imports.install --users
           mix px_imports.install --spend-types
+          mix px_imports.install --hour-types
           mix px_imports.install --month_close
           mix px_imports.install --positions
+          mix px_imports.install --holidays
           mix px_imports.install --org-tree --users
         """)
       else
@@ -129,7 +147,9 @@ if Code.ensure_loaded?(Igniter) do
         sync_employees_worker_module = Module.concat([prefix, Workers, SyncEmployeesWorker])
         sync_projects_worker_module = Module.concat([prefix, Workers, SyncProjectsWorker])
         sync_spend_types_worker_module = Module.concat([prefix, Workers, SyncSpendTypesWorker])
+        sync_hour_types_worker_module = Module.concat([prefix, Workers, SyncHourTypesWorker])
         sync_positions_worker_module = Module.concat([prefix, Workers, SyncPositionsWorker])
+        sync_holidays_worker_module = Module.concat([prefix, Workers, SyncHolidaysWorker])
 
         sync_month_end_close_worker_module =
           Module.concat([prefix, Workers, SyncMonthEndCloseWorker])
@@ -152,6 +172,11 @@ if Code.ensure_loaded?(Igniter) do
               else: e
           end)
           |> then(fn e ->
+            if install_hour_types?,
+              do: e ++ [{"47 2 * * *", sync_hour_types_worker_module}],
+              else: e
+          end)
+          |> then(fn e ->
             if install_month_close?,
               do: e ++ [{"50 2 * * *", sync_month_end_close_worker_module}],
               else: e
@@ -159,6 +184,11 @@ if Code.ensure_loaded?(Igniter) do
           |> then(fn e ->
             if install_positions?,
               do: e ++ [{"55 2 * * *", sync_positions_worker_module}],
+              else: e
+          end)
+          |> then(fn e ->
+            if install_holidays?,
+              do: e ++ [{"58 2 * * *", sync_holidays_worker_module}],
               else: e
           end)
 
@@ -183,6 +213,11 @@ if Code.ensure_loaded?(Igniter) do
               else: resources
           end)
           |> then(fn resources ->
+            if install_hour_types?,
+              do: resources ++ [Module.concat([prefix, Projects, HourType])],
+              else: resources
+          end)
+          |> then(fn resources ->
             if install_month_close?,
               do: resources ++ [Module.concat([prefix, Projects, MonthEndClose])],
               else: resources
@@ -198,17 +233,24 @@ if Code.ensure_loaded?(Igniter) do
               resources
             end
           end)
+          |> then(fn resources ->
+            if install_holidays?,
+              do: resources ++ [Module.concat([prefix, Projects, Holiday])],
+              else: resources
+          end)
 
         all_project_resources = org_tree_resources ++ project_resources
 
         domains_to_add =
-          if install_org_tree? or install_spend_types? or install_month_close? or
-               install_positions?,
+          if install_org_tree? or install_spend_types? or install_hour_types? or
+               install_month_close? or
+               install_positions? or install_holidays?,
              do: [projects_domain_module],
              else: []
 
         igniter
         |> check_oban_present()
+        |> ensure_bds_catalog_ui_import(otp_app)
         |> setup_oban_config(otp_app, repo_module, cron_entries)
         |> update_ash_domains_config(otp_app, domains_to_add)
         |> create_jobs_context(jobs_module, repo_module, otp_app)
@@ -359,13 +401,41 @@ if Code.ensure_loaded?(Igniter) do
           end
         end)
         |> then(fn ign ->
+          if install_hour_types? do
+            hour_type_module = Module.concat([prefix, Projects, HourType])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_spend_types? or install_month_close? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, hour_type_module)
+            |> create_hour_type_resource(
+              hour_type_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_hour_types_worker(
+              sync_hour_types_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
+        |> then(fn ign ->
           if install_positions? do
             position_module = Module.concat([prefix, Projects, Position])
             position_relationship_module = Module.concat([prefix, Projects, PositionRelationship])
 
             ign
             |> then(fn i ->
-              if install_org_tree? or install_spend_types? or install_month_close? do
+              if install_org_tree? or install_spend_types? or install_hour_types? or
+                   install_month_close? do
                 i
               else
                 create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
@@ -385,6 +455,35 @@ if Code.ensure_loaded?(Igniter) do
             )
             |> create_sync_positions_worker(
               sync_positions_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
+        |> then(fn ign ->
+          if install_holidays? do
+            holiday_module = Module.concat([prefix, Projects, Holiday])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_spend_types? or install_hour_types? or
+                   install_month_close? or
+                   install_positions? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, holiday_module)
+            |> create_holiday_resource(
+              holiday_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_holidays_worker(
+              sync_holidays_worker_module,
               projects_domain_module,
               prefix
             )
@@ -427,9 +526,17 @@ if Code.ensure_loaded?(Igniter) do
 
              mix px_imports.install --month_close
 
-        8. To install positions sync only:
+        9. To install hour type sync only:
+
+             mix px_imports.install --hour-types
+
+        10. To install positions sync only:
 
              mix px_imports.install --positions
+
+        11. To install holidays sync only:
+
+             mix px_imports.install --holidays
         """)
       end
     end
@@ -437,6 +544,45 @@ if Code.ensure_loaded?(Igniter) do
     # ──────────────────────────────────────────────
     # Validation & environment checks
     # ──────────────────────────────────────────────
+
+    defp ensure_bds_catalog_ui_import(igniter, otp_app) do
+      web_path = "lib/#{otp_app}_web.ex"
+
+      if Igniter.exists?(igniter, web_path) do
+        Igniter.update_file(igniter, web_path, fn source ->
+          content = Rewrite.Source.get(source, :content)
+
+          content =
+            cond do
+              String.contains?(content, "Bds.Components.CatalogUi") ->
+                content
+
+              String.contains?(content, "import Bds.Components\n") ->
+                String.replace(
+                  content,
+                  "import Bds.Components\n",
+                  "import Bds.Components\n      import Bds.Components.CatalogUi\n",
+                  global: false
+                )
+
+              String.contains?(content, "import Bds.Components") ->
+                String.replace(
+                  content,
+                  "import Bds.Components",
+                  "import Bds.Components\n      import Bds.Components.CatalogUi",
+                  global: false
+                )
+
+              true ->
+                content
+            end
+
+          Rewrite.Source.update(source, :content, content)
+        end)
+      else
+        igniter
+      end
+    end
 
     defp check_oban_present(igniter) do
       mix_exs_content = File.read!("mix.exs")
@@ -744,79 +890,16 @@ if Code.ensure_loaded?(Igniter) do
            live_user_auth_module,
            include_users?
          ) do
-      jobs_card = ~S"""
-              <.link
-                navigate={~p"/admin/jobs"}
-                class="rounded-xl border border-base-300 p-5 hover:bg-base-200/40 transition-colors"
-              >
-                <div class="flex items-center gap-2 font-semibold">
-                  <.icon name="hero-cog-6-tooth" class="w-5 h-5" /> Jobs
-                </div>
-                <p class="mt-2 text-sm text-base-content/70">
-                  Manage scheduled Oban jobs and inspect recent runs.
-                </p>
-              </.link>
-      """
-
-      users_card = ~S"""
-              <.link
-                navigate={~p"/admin/users"}
-                class="rounded-xl border border-base-300 p-5 hover:bg-base-200/40 transition-colors"
-              >
-                <div class="flex items-center gap-2 font-semibold">
-                  <.icon name="hero-users" class="w-5 h-5" /> Users
-                </div>
-                <p class="mt-2 text-sm text-base-content/70">
-                  Manage admin access and impersonation.
-                </p>
-              </.link>
-      """
-
-      cards =
-        [jobs_card]
-        |> then(fn list -> if include_users?, do: list ++ [users_card], else: list end)
-        |> Enum.map(&String.trim_trailing/1)
-        |> Enum.join("\n")
-
-      full_contents = """
-      use #{inspect(web_module)}, :live_view
-
-      on_mount {#{inspect(live_user_auth_module)}, :live_admin_required}
-
-      @impl true
-      def mount(_params, _session, socket) do
-        {:ok, socket}
-      end
-
-      @impl true
-      def render(assigns) do
-        ~H\"\"\"
-        <Layouts.app
-          flash={@flash}
-          current_user={@current_user}
-          current_path={assigns[:current_path] || "/"}
-          impersonator={assigns[:impersonator]}
-        >
-          <div class="mx-auto max-w-3xl">
-            <h1 class="text-4xl font-bold">Admin Dashboard</h1>
-            <p class="mt-3 text-base-content/70">
-              Admin-only tools and maintenance views.
-            </p>
-
-            <div class="mt-8 grid gap-4 sm:grid-cols-2">
-      #{cards}
-            </div>
-          </div>
-        </Layouts.app>
-        \"\"\"
-      end
-      """
+      full_contents =
+        PxImports.AdminTemplates.admin_live_module(
+          web_module,
+          live_user_auth_module,
+          include_users?
+        )
 
       {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, admin_live_module)
 
       if exists? do
-        # Module already exists (e.g. created by bluetab_phoenix). Inject the jobs card
-        # into the render if it isn't there yet.
         case Igniter.Project.Module.find_module(igniter, admin_live_module) do
           {:ok, {igniter, source, _zipper}} ->
             path = Rewrite.Source.get(source, :path)
@@ -826,41 +909,35 @@ if Code.ensure_loaded?(Igniter) do
 
               has_jobs_card? = String.contains?(content, ~s|navigate={~p"/admin/jobs"}|)
               has_users_card? = String.contains?(content, ~s|navigate={~p"/admin/users"}|)
+              uses_bds? = String.contains?(content, "bt_example_grid")
 
-              if has_jobs_card? and (not include_users? or has_users_card?) do
+              if uses_bds? and has_jobs_card? and (not include_users? or has_users_card?) do
                 source
               else
-                # Replace the render function body with one that includes the jobs card.
+                render_body = PxImports.AdminTemplates.admin_live_render(include_users?)
+
                 new_content =
                   Regex.replace(
                     ~r/(def render\(assigns\) do\s*~H""")(.*?)("""(\s*)end)/s,
                     content,
                     fn _, open, _old_body, close, _ ->
-                      new_body = """
+                      open <>
+                        """
 
-                      <Layouts.app
-                        flash={@flash}
-                        current_user={@current_user}
-                        current_path={assigns[:current_path] || "/"}
-                        impersonator={assigns[:impersonator]}
-                      >
-                        <div class="mx-auto max-w-3xl">
-                          <h1 class="text-4xl font-bold">Admin Dashboard</h1>
-                          <p class="mt-3 text-base-content/70">
-                            Admin-only tools and maintenance views.
-                          </p>
-
-                          <div class="mt-8 grid gap-4 sm:grid-cols-2">
-                      #{cards}
-                          </div>
-                        </div>
-                      </Layouts.app>
-                      """
-
-                      open <> new_body <> close
+                        <Layouts.app
+                          flash={@flash}
+                          current_user={@current_user}
+                          current_path={assigns[:current_path] || "/"}
+                          impersonator={assigns[:impersonator]}
+                        >
+                    """ <> render_body <> """
+                        </Layouts.app>
+                    """ <> close
                     end,
                     global: false
                   )
+
+                new_content = ensure_admin_nav_card_fn(new_content)
 
                 Rewrite.Source.update(source, :content, new_content)
               end
@@ -877,6 +954,37 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp ensure_admin_nav_card_fn(content) do
+      if String.contains?(content, "defp admin_nav_card") do
+        content
+      else
+        nav_card_fn = """
+
+      attr :navigate, :string, required: true
+      attr :icon, :string, required: true
+      attr :title, :string, required: true
+      attr :description, :string, required: true
+
+      defp admin_nav_card(assigns) do
+        ~H\"\"\"
+        <.link
+          navigate={@navigate}
+          class="bt-card bt-card--elevated bt-card--half"
+          style="text-decoration: none; color: inherit; transition: box-shadow var(--bt-duration-base) var(--bt-ease);"
+        >
+          <h3 class="bt-section__title">
+            <.icon name={@icon} class="size-5" /> {@title}
+          </h3>
+          <p class="bt-section__description" style="margin-bottom: 0;">{@description}</p>
+        </.link>
+        \"\"\"
+      end
+    """
+
+        append_before_module_end(content, nav_card_fn)
+      end
+    end
+
     defp create_jobs_live(
            igniter,
            jobs_live_module,
@@ -889,155 +997,12 @@ if Code.ensure_loaded?(Igniter) do
       if exists? do
         igniter
       else
-        contents = """
-        use #{inspect(web_module)}, :live_view
-
-        on_mount {#{inspect(live_user_auth_module)}, :live_admin_required}
-
-        alias #{inspect(jobs_module)}
-
-        @impl true
-        def mount(_params, _session, socket) do
-          {:ok,
-           socket
-           |> assign(:page_title, "Jobs")
-           |> assign_jobs()}
-        end
-
-        @impl true
-        def handle_event("run_job", %{"worker" => worker_module_string}, socket) do
-          worker_module = String.to_existing_atom("Elixir." <> worker_module_string)
-
-          case Jobs.run_job_now(worker_module) do
-            {:ok, _job} ->
-              {:noreply,
-               socket
-               |> put_flash(:info, "Job \#{worker_module_string} enqueued successfully.")
-               |> assign_jobs()}
-
-            {:error, _changeset} ->
-              {:noreply, put_flash(socket, :error, "Failed to enqueue job.")}
-          end
-        end
-
-        @impl true
-        def handle_event("refresh", _params, socket) do
-          {:noreply, assign_jobs(socket)}
-        end
-
-        @impl true
-        def render(assigns) do
-          ~H\"\"\"
-          <Layouts.app
-            flash={@flash}
-            current_user={@current_user}
-            current_path={assigns[:current_path] || "/"}
-            impersonator={assigns[:impersonator]}
-          >
-            <div class="space-y-10">
-              <section>
-                <.header>
-                  Scheduled Jobs
-                  <:subtitle>Cron jobs configured to run automatically</:subtitle>
-                </.header>
-
-                <div class="mt-6 overflow-hidden rounded-xl border border-base-300">
-                  <table class="table w-full">
-                    <thead>
-                      <tr>
-                        <th>Worker</th>
-                        <th>Schedule</th>
-                        <th class="text-right">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr :for={job <- @scheduled_jobs} id={"scheduled-job-\#{job.worker}"}>
-                        <td class="font-semibold">{job.worker}</td>
-                        <td><code>{job.cron}</code></td>
-                        <td class="text-right">
-                          <.button
-                            phx-click="run_job"
-                            phx-value-worker={inspect(job.worker_module) |> String.trim_leading("Elixir.")}
-                            data-confirm={"Run \#{job.worker} now?"}
-                          >
-                            <.icon name="hero-play-solid" class="w-4 h-4 mr-1" /> Run now
-                          </.button>
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </section>
-
-              <section>
-                <.header>
-                  Recent Job Runs
-                  <:subtitle>History of Oban job executions</:subtitle>
-                  <:actions>
-                    <.button id="jobs-refresh-button" phx-click="refresh">
-                      <.icon name="hero-arrow-path" class="w-4 h-4 mr-1" /> Refresh
-                    </.button>
-                  </:actions>
-                </.header>
-
-                <div class="mt-6 overflow-hidden rounded-xl border border-base-300">
-                  <table class="table w-full">
-                    <thead>
-                      <tr>
-                        <th>ID</th>
-                        <th>Worker</th>
-                        <th>State</th>
-                        <th>Queue</th>
-                        <th>Attempt</th>
-                        <th>Inserted</th>
-                        <th>Completed</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr
-                        :for={job <- @recent_jobs}
-                        id={"job-row-\#{job.id}"}
-                        class="cursor-pointer hover:bg-base-200/40 transition-colors"
-                        phx-click={JS.navigate(~p"/admin/jobs/\#{job.id}")}
-                      >
-                        <td class="font-mono text-xs">{job.id}</td>
-                        <td class="font-semibold">{short_worker_name(job.worker)}</td>
-                        <td>{job.state}</td>
-                        <td>{job.queue}</td>
-                        <td>{job.attempt}/{job.max_attempts}</td>
-                        <td class="text-xs">{format_datetime(job.inserted_at)}</td>
-                        <td class="text-xs">{format_datetime(job.completed_at)}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  <p :if={@recent_jobs == []} class="text-center text-base-content/70 py-8">
-                    No jobs have been executed yet.
-                  </p>
-                </div>
-              </section>
-            </div>
-          </Layouts.app>
-          \"\"\"
-        end
-
-        defp assign_jobs(socket) do
-          socket
-          |> assign(:scheduled_jobs, Jobs.list_scheduled_jobs())
-          |> assign(:recent_jobs, Jobs.list_recent_jobs())
-        end
-
-        defp short_worker_name(worker) when is_binary(worker) do
-          worker
-          |> String.split(".")
-          |> List.last()
-        end
-
-        defp format_datetime(nil), do: "-"
-
-        defp format_datetime(datetime) do
-          Calendar.strftime(datetime, "%Y-%m-%d %H:%M:%S")
-        end
-        """
+        contents =
+          PxImports.AdminTemplates.jobs_live_module(
+            web_module,
+            live_user_auth_module,
+            jobs_module
+          )
 
         Igniter.Project.Module.create_module(igniter, jobs_live_module, contents)
       end
@@ -1055,316 +1020,12 @@ if Code.ensure_loaded?(Igniter) do
       if exists? do
         igniter
       else
-        contents = """
-        use #{inspect(web_module)}, :live_view
-
-        on_mount {#{inspect(live_user_auth_module)}, :live_admin_required}
-
-        alias #{inspect(jobs_module)}
-
-        @impl true
-        def mount(%{"id" => id}, _session, socket) do
-          job = Jobs.get_job!(String.to_integer(id))
-
-          {:ok,
-           socket
-           |> assign(:page_title, "Job #\#{job.id}")
-           |> assign(:job, job)}
-        end
-
-        @impl true
-        def render(assigns) do
-          ~H\"\"\"
-          <Layouts.app
-            flash={@flash}
-            current_user={@current_user}
-            current_path={assigns[:current_path] || "/"}
-            impersonator={assigns[:impersonator]}
-          >
-            <div class="space-y-8">
-              <div class="flex items-center justify-between gap-4">
-                <div>
-                  <h1 class="text-2xl font-bold">Job #{"#\#{@job.id}"}</h1>
-                  <p class="text-sm text-base-content/70">{@job.worker}</p>
-                </div>
-                <.link navigate={~p"/admin/jobs"} class="btn btn-sm btn-ghost">
-                  <.icon name="hero-arrow-left" class="w-4 h-4 mr-1" /> Back
-                </.link>
-              </div>
-
-              <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <div class="rounded-xl border border-base-300 p-4">
-                  <p class="text-xs uppercase text-base-content/70">State</p>
-                  <p class="mt-1 text-lg font-semibold">{@job.state}</p>
-                </div>
-                <div class="rounded-xl border border-base-300 p-4">
-                  <p class="text-xs uppercase text-base-content/70">Queue</p>
-                  <p class="mt-1 text-lg font-semibold">{@job.queue}</p>
-                </div>
-                <div class="rounded-xl border border-base-300 p-4">
-                  <p class="text-xs uppercase text-base-content/70">Attempts</p>
-                  <p class="mt-1 text-lg font-semibold">{@job.attempt}/{@job.max_attempts}</p>
-                </div>
-                <div class="rounded-xl border border-base-300 p-4">
-                  <p class="text-xs uppercase text-base-content/70">Inserted</p>
-                  <p class="mt-1 text-sm font-semibold">{format_datetime(@job.inserted_at)}</p>
-                </div>
-              </div>
-
-              <div class="rounded-xl border border-base-300 p-4">
-                <h2 class="font-semibold">Args</h2>
-                <pre class="mt-2 text-xs overflow-x-auto"><%= inspect(@job.args, pretty: true, limit: :infinity) %></pre>
-              </div>
-
-              <div class="rounded-xl border border-base-300 p-4">
-                <h2 class="font-semibold">Meta</h2>
-                <div :if={@job.meta in [%{}, nil]} class="mt-2 text-sm text-base-content/70">
-                  No metadata recorded for this job.
-                </div>
-
-                <div :if={@job.meta not in [%{}, nil]} class="mt-3 space-y-4">
-                  <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
-                    <.meta_stat_card label="Total records" value={meta_total(@job.meta)} />
-                    <.meta_stat_card label="Created" value={meta_count(@job.meta, "created_count")} />
-                    <.meta_stat_card label="Updated" value={meta_count(@job.meta, "updated_count")} />
-                    <.meta_stat_card label="Skipped" value={meta_count(@job.meta, "skipped_count")} />
-                    <.meta_stat_card label="Not found" value={meta_count(@job.meta, "not_found_count")} />
-                    <.meta_stat_card label="Failed" value={meta_count(@job.meta, "failed_count")} />
-                  </div>
-
-                  <p :if={@job.meta["completed_at"]} class="text-xs text-base-content/70">
-                    Completed at: {format_iso_datetime(@job.meta["completed_at"])}
-                  </p>
-
-                  <details class="rounded-lg border border-base-300 p-3">
-                    <summary class="cursor-pointer font-medium">Created records</summary>
-                    <div class="mt-3 space-y-1">
-                      <p :if={meta_created(@job.meta) == []} class="text-sm text-base-content/70">
-                        No created records.
-                      </p>
-                      <div
-                        :for={{item, index} <- Enum.with_index(meta_created(@job.meta), 1)}
-                        id={"meta-created-\#{index}"}
-                        class="rounded-lg border border-info/30 bg-info/5 p-3 text-sm"
-                      >
-                        <p class="font-semibold">{item["name"] || item[:name] || "Unnamed"}</p>
-                        <p class="text-xs text-base-content/70">
-                          SAP ID: {item["sap_id"] || item[:sap_id] || "-"}
-                        </p>
-                      </div>
-                    </div>
-                  </details>
-
-                  <details class="rounded-lg border border-base-300 p-3">
-                    <summary class="cursor-pointer font-medium">Updated records</summary>
-                    <div class="mt-3 space-y-2">
-                      <p :if={meta_updated(@job.meta) == []} class="text-sm text-base-content/70">
-                        No updated records.
-                      </p>
-                      <div
-                        :for={{item, index} <- Enum.with_index(meta_updated(@job.meta), 1)}
-                        id={"meta-updated-\#{index}"}
-                        class="rounded-lg border border-success/30 bg-success/5 p-3"
-                      >
-                        <p class="text-sm font-semibold">{item["email"] || item["name"] || "Unknown"}</p>
-                        <ul class="mt-2 space-y-1 text-xs">
-                          <li :for={change <- item["changes"] || []}>
-                            <span class="font-semibold">{change["field"]}:</span> {change["new_value"]}
-                          </li>
-                        </ul>
-                      </div>
-                    </div>
-                  </details>
-
-                  <details class="rounded-lg border border-base-300 p-3">
-                    <summary class="cursor-pointer font-medium">Skipped records</summary>
-                    <div class="mt-3 space-y-1">
-                      <p :if={meta_skipped(@job.meta) == []} class="text-sm text-base-content/70">
-                        No skipped records.
-                      </p>
-                      <p :for={item <- meta_skipped(@job.meta)} class="text-sm">
-                        {meta_item_label(item)}
-                      </p>
-                    </div>
-                  </details>
-
-                  <details class="rounded-lg border border-base-300 p-3">
-                    <summary class="cursor-pointer font-medium">Not found records</summary>
-                    <div class="mt-3 space-y-1">
-                      <p :if={meta_not_found(@job.meta) == []} class="text-sm text-base-content/70">
-                        No not-found records.
-                      </p>
-                      <p :for={item <- meta_not_found(@job.meta)} class="text-sm">
-                        {meta_item_label(item)}
-                      </p>
-                    </div>
-                  </details>
-
-                  <details class="rounded-lg border border-base-300 p-3">
-                    <summary class="cursor-pointer font-medium">Failed records</summary>
-                    <div class="mt-3 space-y-2">
-                      <p :if={meta_failed(@job.meta) == []} class="text-sm text-base-content/70">
-                        No failed records.
-                      </p>
-                      <div
-                        :for={{item, index} <- Enum.with_index(meta_failed(@job.meta), 1)}
-                        id={"meta-failed-\#{index}"}
-                        class="rounded-lg border border-error/30 bg-error/5 p-3"
-                      >
-                        <p class="text-xs font-semibold">
-                          SAP ID: {item["sap_id"] || item[:sap_id] || "-"}
-                        </p>
-                        <pre class="mt-2 overflow-x-auto whitespace-pre-wrap break-words text-xs leading-5"><%= item["error"] || item[:error] || inspect(item) %></pre>
-                      </div>
-                    </div>
-                  </details>
-
-                  <details class="rounded-lg border border-base-300 p-3">
-                    <summary class="cursor-pointer font-medium">Raw metadata</summary>
-                    <pre class="mt-3 text-xs overflow-x-auto"><%= inspect(@job.meta, pretty: true, limit: :infinity) %></pre>
-                  </details>
-                </div>
-              </div>
-
-              <div class="rounded-xl border border-base-300 p-4">
-                <h2 class="font-semibold">Errors</h2>
-                <div :if={@job.errors == []} class="mt-2 text-sm text-base-content/70">
-                  No errors recorded for this job.
-                </div>
-                <div :if={@job.errors != []} class="mt-3 space-y-3">
-                  <div
-                    :for={{error, index} <- Enum.with_index(@job.errors, 1)}
-                    id={"job-error-\#{index}"}
-                    class="rounded-lg border border-error/30 bg-error/5 p-4"
-                  >
-                    <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
-                      <p class="text-sm font-semibold text-error">Attempt {error_attempt(error)}</p>
-                      <p class="text-xs text-base-content/70">
-                        {format_iso_datetime(error["at"])}
-                      </p>
-                    </div>
-                    <pre class="mt-3 overflow-x-auto whitespace-pre-wrap break-words text-xs leading-5"><%= error_message(error) %></pre>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </Layouts.app>
-          \"\"\"
-        end
-
-        defp format_datetime(nil), do: "-"
-
-        defp format_datetime(datetime) do
-          Calendar.strftime(datetime, "%Y-%m-%d %H:%M:%S")
-        end
-
-        defp format_iso_datetime(nil), do: "-"
-
-        defp format_iso_datetime(value) when is_binary(value) do
-          case DateTime.from_iso8601(value) do
-            {:ok, datetime, _offset} -> format_datetime(datetime)
-            _ -> value
-          end
-        end
-
-        defp format_iso_datetime(value), do: inspect(value)
-
-        defp error_attempt(%{"attempt" => attempt}), do: attempt
-        defp error_attempt(_), do: "-"
-
-        defp error_message(%{"error" => error}) when is_binary(error), do: error
-        defp error_message(error), do: inspect(error, pretty: true, limit: :infinity)
-
-        attr :label, :string, required: true
-        attr :value, :any, required: true
-
-        defp meta_stat_card(assigns) do
-          ~H\"\"\"
-          <div class="rounded-lg border border-base-300 p-3">
-            <p class="text-xs uppercase text-base-content/70">{@label}</p>
-            <p class="mt-1 text-xl font-semibold">{@value}</p>
-          </div>
-          \"\"\"
-        end
-
-        defp meta_total(meta) do
-          if org_tree_meta?(meta) do
-            stage_count(meta, "total")
-          else
-            meta_get(meta, "total_employees", meta_get(meta, "total_projects", 0))
-          end
-        end
-
-        defp meta_count(meta, key) do
-          if org_tree_meta?(meta) do
-            stage_count(meta, key)
-          else
-            meta_get(meta, key, 0)
-          end
-        end
-
-        defp meta_created(meta), do: meta_list(meta, "created")
-        defp meta_updated(meta), do: meta_list(meta, "updated")
-        defp meta_skipped(meta), do: meta_list(meta, "skipped")
-        defp meta_not_found(meta), do: meta_list(meta, "not_found")
-        defp meta_failed(meta), do: meta_list(meta, "failed")
-
-        defp meta_item_label(item) when is_binary(item), do: item
-
-        defp meta_item_label(item) when is_map(item) do
-          item["email"] || item["name"] || item["sap_id"] || inspect(item)
-        end
-
-        defp meta_item_label(item), do: to_string(item)
-
-        defp org_tree_meta?(meta) do
-          Enum.any?(stage_keys(), fn stage ->
-            stage_data = meta_get(meta, stage, %{})
-            is_map(stage_data) and stage_data != %{}
-          end)
-        end
-
-        defp stage_keys do
-          ["business_units", "clusters", "client_groups", "clients", "projects"]
-        end
-
-        defp stage_count(meta, key) do
-          Enum.reduce(stage_keys(), 0, fn stage, acc ->
-            stage_data = meta_get(meta, stage, %{})
-            acc + meta_get(stage_data, key, 0)
-          end)
-        end
-
-        defp meta_list(meta, key) do
-          if org_tree_meta?(meta) do
-            Enum.flat_map(stage_keys(), fn stage ->
-              stage_data = meta_get(meta, stage, %{})
-              Enum.map(meta_get(stage_data, key, []), fn item -> attach_stage(item, stage) end)
-            end)
-          else
-            meta_get(meta, key, [])
-          end
-        end
-
-        defp attach_stage(item, stage) when is_map(item), do: Map.put_new(item, "stage", stage)
-        defp attach_stage(item, _stage), do: item
-
-        defp meta_get(nil, _key, default), do: default
-
-        defp meta_get(map, key, default) when is_map(map) and is_binary(key) do
-          atom_key =
-            try do
-              String.to_existing_atom(key)
-            rescue
-              ArgumentError -> nil
-            end
-
-          case atom_key do
-            nil -> Map.get(map, key, default)
-            _ -> Map.get(map, key, Map.get(map, atom_key, default))
-          end
-        end
-        """
+        contents =
+          PxImports.AdminTemplates.job_show_live_module(
+            web_module,
+            live_user_auth_module,
+            jobs_module
+          )
 
         Igniter.Project.Module.create_module(igniter, job_show_live_module, contents)
       end
@@ -1383,354 +1044,13 @@ if Code.ensure_loaded?(Igniter) do
       if exists? do
         igniter
       else
-        contents = """
-        use #{inspect(web_module)}, :live_view
-
-        require Ash.Query
-        require Ash.Expr
-
-        alias #{inspect(accounts_module)}, as: Accounts
-        alias #{inspect(user_module)}, as: User
-
-        on_mount {#{inspect(live_user_auth_module)}, :live_admin_required}
-
-        @per_page 25
-
-        @impl true
-        def mount(_params, _session, socket) do
-          {:ok, socket}
-        end
-
-        @impl true
-        def handle_params(params, _uri, socket) do
-          page = parse_page(Map.get(params, "page"))
-          q = params |> Map.get("q", "") |> to_string() |> String.trim()
-          show_inactive = parse_bool(Map.get(params, "show_inactive"))
-          filter_form = to_form(%{"q" => q, "show_inactive" => show_inactive}, as: :filter)
-
-          socket =
-            socket
-            |> assign(
-              page: page,
-              search_q: q,
-              show_inactive: show_inactive,
-              filter_form: filter_form
-            )
-            |> load_users_page()
-
-          {:noreply, socket}
-        end
-
-        @impl true
-        def handle_event("search", %{"filter" => filter_params}, socket) do
-          q = filter_params |> Map.get("q", "") |> to_string() |> String.trim()
-          show_inactive = parse_bool(Map.get(filter_params, "show_inactive"))
-
-          {:noreply, push_patch(socket, to: users_patch_path(1, q, show_inactive))}
-        end
-
-        def handle_event("search", _params, socket) do
-          {:noreply, push_patch(socket, to: users_patch_path(1, socket.assigns.search_q, false))}
-        end
-
-        @impl true
-        def handle_event("ignore_search_submit", _params, socket) do
-          {:noreply, socket}
-        end
-
-        @impl true
-        def handle_event("toggle_admin", %{"id" => id}, socket) do
-          user = Enum.find(socket.assigns.users, &(to_string(&1.id) == id))
-
-          case user do
-            nil ->
-              {:noreply, put_flash(socket, :error, "User not found on this page")}
-
-            user ->
-              user
-              |> Ash.Changeset.for_update(:set_admin, %{is_admin: !user.is_admin},
-                actor: socket.assigns.current_user
-              )
-              |> Ash.update(domain: Accounts, actor: socket.assigns.current_user, authorize?: false)
-              |> case do
-                {:ok, _updated_user} ->
-                  {:noreply, socket |> put_flash(:info, "Admin flag updated") |> load_users_page()}
-
-                {:error, reason} ->
-                  {:noreply, put_flash(socket, :error, "Failed to update admin flag: \#{inspect(reason)}")}
-              end
-          end
-        end
-
-        defp load_users_page(socket) do
-          page = socket.assigns.page
-          q = socket.assigns.search_q
-          show_inactive = socket.assigns.show_inactive
-
-          query =
-            User
-            |> Ash.Query.for_read(:list_for_admin)
-            |> maybe_filter_active(show_inactive)
-            |> maybe_filter_search(q)
-            |> Ash.Query.sort(:email)
-            |> Ash.Query.page(limit: @per_page, offset: (page - 1) * @per_page, count: true)
-
-          %Ash.Page.Offset{
-            results: users,
-            count: total,
-            limit: limit,
-            offset: offset
-          } = Ash.read!(query, domain: Accounts, authorize?: false)
-
-          more? = offset + length(users) < total
-
-          assign(socket,
-            users: users,
-            users_total: total,
-            users_limit: limit,
-            users_offset: offset,
-            users_more?: more?
+        contents =
+          PxImports.AdminTemplates.users_live_module(
+            web_module,
+            live_user_auth_module,
+            accounts_module,
+            user_module
           )
-        end
-
-        defp maybe_filter_search(query, ""), do: query
-
-        defp maybe_filter_search(query, term) do
-          Ash.Query.filter(
-            query,
-            Ash.Expr.expr(
-              contains(email, ^term) or
-                (not is_nil(given_name) and contains(given_name, ^term)) or
-                (not is_nil(family_name) and contains(family_name, ^term))
-            )
-          )
-        end
-
-        defp maybe_filter_active(query, true), do: query
-
-        defp maybe_filter_active(query, false) do
-          Ash.Query.filter(query, Ash.Expr.expr(is_nil(hidden_at)))
-        end
-
-        defp parse_page(nil), do: 1
-        defp parse_page(""), do: 1
-
-        defp parse_page(str) do
-          case Integer.parse(to_string(str)) do
-            {n, _} when n > 0 -> n
-            _ -> 1
-          end
-        end
-
-        defp parse_bool(value), do: value in [true, "true", "on", "1", 1]
-
-        defp users_patch_path(page, q, show_inactive) do
-          pairs =
-            []
-            |> then(fn acc -> if page > 1, do: [{"page", Integer.to_string(page)} | acc], else: acc end)
-            |> then(fn acc -> if q != "", do: [{"q", q} | acc], else: acc end)
-            |> then(fn acc ->
-              if show_inactive, do: [{"show_inactive", "true"} | acc], else: acc
-            end)
-
-          base = ~p"/admin/users"
-
-          case pairs do
-            [] -> base
-            _ -> base <> "?" <> URI.encode_query(pairs)
-          end
-        end
-
-        defp range_label(offset, total, shown) do
-          start_i = offset + 1
-          end_i = offset + shown
-
-          cond do
-            total == 0 ->
-              "No users"
-
-            shown == 0 ->
-              "No users on this page"
-
-            true ->
-              "\#{start_i}-\#{end_i} of \#{total}"
-          end
-        end
-
-        defp join_date_label(nil), do: "—"
-        defp join_date_label(%Date{} = date), do: Date.to_iso8601(date)
-
-        defp hidden_at_title(nil), do: ""
-        defp hidden_at_title(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
-        defp hidden_at_title(%NaiveDateTime{} = datetime), do: NaiveDateTime.to_iso8601(datetime)
-        defp hidden_at_title(%Date{} = date), do: Date.to_iso8601(date)
-        defp hidden_at_title(value), do: to_string(value)
-
-        @impl true
-        def render(assigns) do
-          assigns =
-            assign(
-              assigns,
-              :range_label,
-              range_label(assigns.users_offset, assigns.users_total, length(assigns.users))
-            )
-
-          ~H\"\"\"
-          <Layouts.app
-            flash={@flash}
-            current_user={@current_user}
-            current_path={assigns[:current_path] || "/"}
-            impersonator={assigns[:impersonator]}
-          >
-            <.header>
-              Users
-              <:subtitle>Manage admin access and impersonation.</:subtitle>
-            </.header>
-
-            <div class="flex flex-col gap-4 mb-4">
-              <.form
-                for={@filter_form}
-                phx-change="search"
-                phx-submit="ignore_search_submit"
-                class="flex flex-wrap items-end gap-3"
-              >
-                <div class="flex-1 min-w-[12rem] max-w-md">
-                  <.input
-                    field={@filter_form[:q]}
-                    type="search"
-                    label="Search"
-                    placeholder="Email or name..."
-                    phx-debounce="300"
-                  />
-                </div>
-                <.input
-                  field={@filter_form[:show_inactive]}
-                  type="checkbox"
-                  label="Show inactive users"
-                />
-                <.link
-                  :if={@search_q != ""}
-                  patch={users_patch_path(1, "", @show_inactive)}
-                  class="btn btn-ghost btn-sm"
-                >
-                  Clear
-                </.link>
-              </.form>
-
-              <div class="text-sm text-base-content/70 flex flex-wrap items-center justify-between gap-2">
-                <span>{@range_label}</span>
-                <div class="join">
-                  <%= if @page <= 1 do %>
-                    <span class="join-item btn btn-sm btn-disabled">Previous</span>
-                  <% else %>
-                    <.link
-                      patch={users_patch_path(@page - 1, @search_q, @show_inactive)}
-                      class="join-item btn btn-sm"
-                    >
-                      Previous
-                    </.link>
-                  <% end %>
-
-                  <button type="button" class="join-item btn btn-sm btn-ghost no-animation">
-                    Page {@page}
-                  </button>
-
-                  <%= if @users_more? do %>
-                    <.link
-                      patch={users_patch_path(@page + 1, @search_q, @show_inactive)}
-                      class="join-item btn btn-sm"
-                    >
-                      Next
-                    </.link>
-                  <% else %>
-                    <span class="join-item btn btn-sm btn-disabled">Next</span>
-                  <% end %>
-                </div>
-              </div>
-            </div>
-
-            <div class="overflow-x-auto rounded-xl border border-base-300">
-              <table class="table w-full">
-                <thead>
-                  <tr>
-                    <th>Email</th>
-                    <th>Name</th>
-                    <th>Admin</th>
-                    <th>Category</th>
-                    <th>Join date</th>
-                    <th class="text-right">Impersonate</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :if={@users == []}>
-                    <td colspan="6" class="text-center text-base-content/60 py-8">
-                      <%= if @search_q != "" do %>
-                        No users match this search.
-                      <% else %>
-                        No users yet.
-                      <% end %>
-                    </td>
-                  </tr>
-                  <tr :for={user <- @users}>
-                    <td>
-                      <span class="font-medium">{user.email}</span>
-                    </td>
-                    <td>{user.given_name} {user.family_name}</td>
-                    <td>
-                      <div class="flex flex-wrap items-center gap-2">
-                        <span :if={user.is_admin} class="badge badge-primary">Admin</span>
-                        <span :if={!user.is_admin} class="text-base-content/50">—</span>
-                        <.button
-                          :if={!user.is_admin}
-                          phx-click="toggle_admin"
-                          phx-value-id={user.id}
-                          class="btn btn-xs btn-ghost"
-                        >
-                          Grant admin
-                        </.button>
-                        <.button
-                          :if={user.is_admin and user.id != @current_user.id}
-                          phx-click="toggle_admin"
-                          phx-value-id={user.id}
-                          class="btn btn-xs btn-error"
-                        >
-                          Revoke admin
-                        </.button>
-                      </div>
-                    </td>
-                    <td>{user.category_name || user.category || "—"}</td>
-                    <td>
-                      <div class="flex flex-col gap-1">
-                        <span>{join_date_label(user.join_date)}</span>
-                        <span
-                          :if={!is_nil(user.hidden_at)}
-                          class="text-xs font-medium text-warning"
-                          title={hidden_at_title(user.hidden_at)}
-                        >
-                          Inactive
-                        </span>
-                      </div>
-                    </td>
-                    <td class="text-right">
-                      <.form for={%{}} action={~p"/admin/impersonation/start/\#{user.id}"} method="post">
-                        <input
-                          type="hidden"
-                          name="_csrf_token"
-                          value={Plug.CSRFProtection.get_csrf_token()}
-                        />
-                        <button type="submit" class="btn btn-xs btn-outline">
-                          Impersonate
-                        </button>
-                      </.form>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </Layouts.app>
-          \"\"\"
-        end
-        """
 
         Igniter.Project.Module.create_module(igniter, users_live_module, contents)
       end
@@ -2138,31 +1458,7 @@ if Code.ensure_loaded?(Igniter) do
       if String.contains?(content, "defp impersonation_banner(assigns)") do
         content
       else
-        banner_fn = """
-          attr :impersonator, :map, required: true
-          attr :current_user, :map, required: true
-          attr :current_path, :string, default: "/"
-
-          defp impersonation_banner(assigns) do
-            ~H\"\"\"
-            <div class="border-b border-warning/35 bg-warning/12 text-base-content">
-              <div class="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-2 text-sm sm:px-6 lg:px-8">
-                <span>
-                  Impersonating <strong>{@current_user.email}</strong>
-                  as <strong>{@impersonator.email}</strong>
-                </span>
-                <.link
-                  href={~p"/admin/impersonation/stop?\#{[return_to: @current_path]}"}
-                  class="btn btn-xs btn-outline border-warning/40"
-                >
-                  Stop impersonating
-                </.link>
-              </div>
-            </div>
-            \"\"\"
-          end
-
-        """
+        banner_fn = PxImports.AdminTemplates.impersonation_banner_fn()
 
         if String.contains?(content, ~S'@doc """
   Shows the flash group with standard titles and content.') do
@@ -3221,6 +2517,11 @@ if Code.ensure_loaded?(Igniter) do
         :category_name,
         "attribute :category_name, :string"
       )
+      |> Ash.Resource.Igniter.add_new_attribute(
+        user_module,
+        :hub,
+        "attribute :hub, :string"
+      )
       |> Ash.Resource.Igniter.add_new_action(
         user_module,
         :provision_from_employee_sync,
@@ -3236,7 +2537,8 @@ if Code.ensure_loaded?(Igniter) do
             :hidden_at,
             :sap_id,
             :category,
-            :category_name
+            :category_name,
+            :hub
           ]
 
           change set_attribute(:confirmed_at, &DateTime.utc_now/0)
@@ -3253,7 +2555,8 @@ if Code.ensure_loaded?(Igniter) do
             :hidden_at,
             :sap_id,
             :category,
-            :category_name
+            :category_name,
+            :hub
           ]
         end
         """
@@ -3299,7 +2602,7 @@ if Code.ensure_loaded?(Igniter) do
 
         Matches employees to existing users by email address. Updates employee
         fields on existing users (sap_id, join_date, hidden_at from termination_date,
-        `category` and `category_name` from PX). Creates new users when no row exists
+        `category`, `category_name`, and `hub` from PX). Creates new users when no row exists
         for the employee email yet.
 
         Reporting structure is synced via `SyncPositionsWorker`, not from employee records.
@@ -3468,6 +2771,7 @@ if Code.ensure_loaded?(Igniter) do
           |> put_if_present(:sap_id, parse_integer_field(employee["sap_employee_number"]))
           |> Map.put(:category, normalize_optional_string(employee["category"]))
           |> Map.put(:category_name, normalize_optional_string(employee["category_name"]))
+          |> Map.put(:hub, normalize_optional_string(employee["hub"]))
         end
 
         defp put_if_present(attrs, _key, nil), do: attrs
@@ -3542,6 +2846,7 @@ if Code.ensure_loaded?(Igniter) do
           |> maybe_put_sap_id(user, employee)
           |> maybe_put_category(user, employee)
           |> maybe_put_category_name(user, employee)
+          |> maybe_put_hub(user, employee)
         end
 
         defp maybe_put_join_date(attrs, user, employee) do
@@ -3586,6 +2891,16 @@ if Code.ensure_loaded?(Igniter) do
 
           if normalize_optional_string(Map.get(user, :category_name)) != desired do
             Map.put(attrs, :category_name, desired)
+          else
+            attrs
+          end
+        end
+
+        defp maybe_put_hub(attrs, user, employee) do
+          desired = normalize_optional_string(employee["hub"])
+
+          if normalize_optional_string(Map.get(user, :hub)) != desired do
+            Map.put(attrs, :hub, desired)
           else
             attrs
           end
@@ -3980,6 +3295,771 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp parse_integer(_), do: nil
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
+    # Hour types: HourType resource + SyncHourTypesWorker
+    # ──────────────────────────────────────────────
+
+    defp create_hour_type_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "hour_types"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+            accept [:id, :name, :is_default, :hidden_at]
+          end
+
+          update :sync_from_px do
+            accept [:name, :is_default, :hidden_at]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          attribute :id, :string do
+            primary_key? true
+            allow_nil? false
+            public? true
+          end
+
+          attribute :name, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :is_default, :boolean do
+            allow_nil? false
+            default false
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_hour_types_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        hour_type_module = Module.concat(domain_module, HourType)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes SAP SOAP hour types into the local Projects.HourType resource.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(hour_type_module)}
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs the provided hour types payload into the local hour_types table.
+        \"\"\"
+        def execute(hour_types) when is_list(hour_types) do
+          sync_hour_types(hour_types)
+        end
+
+        defp run_sync do
+          case BluetabConnect.Sap.Soap.Proyectos.get_tipos_horas() do
+            {:ok, hour_types} when is_list(hour_types) ->
+              {:ok, execute(hour_types)}
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp sync_hour_types(hour_types) do
+          existing_hour_types = Ash.read!(HourType, domain: Projects, authorize?: false)
+          existing_by_id = Map.new(existing_hour_types, &{&1.id, &1})
+
+          result =
+            Enum.reduce(
+              hour_types,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_hour_type, acc ->
+                attrs = extract_hour_type_attrs(raw_hour_type)
+                hour_type_id = Map.get(attrs, :id)
+                name = Map.get(attrs, :name)
+
+                case Map.get(existing_by_id, hour_type_id) do
+                  nil ->
+                    case Ash.create(HourType, attrs,
+                           action: :create,
+                           domain: Projects,
+                           authorize?: false
+                         ) do
+                      {:ok, _created} ->
+                        %{acc | created: [%{id: hour_type_id, name: name} | acc.created]}
+
+                      {:error, error} ->
+                        %{
+                          acc
+                          | failed: [
+                              %{id: hour_type_id, name: name, error: inspect(error)}
+                              | acc.failed
+                            ]
+                        }
+                    end
+
+                  existing ->
+                    changes = build_changes(existing, attrs)
+
+                    if map_size(changes) == 0 do
+                      %{acc | skipped: [%{id: hour_type_id, name: name} | acc.skipped]}
+                    else
+                      case existing
+                           |> Ash.Changeset.for_update(:sync_from_px, changes)
+                           |> Ash.update(authorize?: false) do
+                        {:ok, _updated} ->
+                          %{
+                            acc
+                            | updated: [
+                                %{id: hour_type_id, name: name, changes: presentable_changes(changes)}
+                                | acc.updated
+                              ]
+                          }
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                %{id: hour_type_id, name: name, error: inspect(error)}
+                                | acc.failed
+                              ]
+                          }
+                      end
+                    end
+                end
+              end
+            )
+
+          incoming_ids =
+            hour_types
+            |> Enum.map(&extract_hour_type_attrs/1)
+            |> Enum.map(&Map.get(&1, :id))
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_hour_types, incoming_ids, result)
+
+          %{
+            total: length(hour_types),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp extract_hour_type_attrs(raw) do
+          %{
+            id: raw |> map_get(:code) |> normalize_string(),
+            name: raw |> map_get(:name) |> normalize_string(),
+            is_default: raw |> map_get(:is_default) |> parse_boolean()
+          }
+          |> drop_nil_values()
+        end
+
+        defp build_changes(existing, attrs) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([:id])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp soft_hide_missing(existing_hour_types, incoming_ids, result) do
+          Enum.reduce(existing_hour_types, result, fn hour_type, acc ->
+            cond do
+              MapSet.member?(incoming_ids, hour_type.id) ->
+                acc
+
+              not is_nil(hour_type.hidden_at) ->
+                acc
+
+              true ->
+                case hour_type
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [%{id: hour_type.id, name: hour_type.name} | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [%{id: hour_type.id, name: hour_type.name, error: inspect(error)} | acc.failed]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp empty_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp map_get(map, key) when is_map(map) do
+          Map.get(map, key) || Map.get(map, to_string(key))
+        end
+
+        defp map_get(_map, _key), do: nil
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(value), do: inspect(value)
+
+        defp parse_boolean(true), do: true
+        defp parse_boolean(false), do: false
+        defp parse_boolean(1), do: true
+        defp parse_boolean(0), do: false
+
+        defp parse_boolean(value) when is_binary(value) do
+          case String.downcase(String.trim(value)) do
+            "true" -> true
+            "1" -> true
+            "false" -> false
+            "0" -> false
+            _ -> nil
+          end
+        end
+
+        defp parse_boolean(_), do: nil
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
+    # Holidays: Holiday resource + SyncHolidaysWorker
+    # ──────────────────────────────────────────────
+
+    defp create_holiday_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "holidays"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+            accept [:calendar_code, :date, :holiday_code, :name, :hidden_at]
+          end
+
+          update :sync_from_px do
+            accept [:name, :hidden_at]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          uuid_primary_key :id
+
+          attribute :calendar_code, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :date, :date do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :holiday_code, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :name, :string do
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+
+        identities do
+          identity :unique_holiday, [:calendar_code, :date, :holiday_code]
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_holidays_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        holiday_module = Module.concat(domain_module, Holiday)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes SuccessFactors holiday calendars into the local Projects.Holiday resource.
+
+        The source payload is nested (`calendars.holidays`) and gets flattened into holiday rows.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(holiday_module)}, as: Holiday
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs a flat holiday list into the local holidays table.
+        \"\"\"
+        def execute(holidays) when is_list(holidays) do
+          sync_holidays(holidays)
+        end
+
+        defp run_sync do
+          case BluetabConnect.Sap.SuccessFactors.list_holiday_calendars() do
+            {:ok, calendars} when is_list(calendars) ->
+              calendars
+              |> flatten_holiday_calendars()
+              |> execute()
+              |> then(&{:ok, &1})
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp flatten_holiday_calendars(calendars) do
+          Enum.flat_map(calendars, fn calendar ->
+            calendar_code = normalize_string(map_get(calendar, :code))
+
+            holidays =
+              case map_get(calendar, :holidays) do
+                items when is_list(items) -> items
+                _ -> []
+              end
+
+            Enum.map(holidays, fn holiday ->
+              %{
+                calendar_code: calendar_code,
+                date: map_get(holiday, :date),
+                holiday_code: map_get(holiday, :holiday_code),
+                name: map_get(holiday, :name)
+              }
+            end)
+          end)
+        end
+
+        defp sync_holidays(holidays) do
+          existing_holidays = Ash.read!(Holiday, domain: Projects, authorize?: false)
+          existing_by_key = Map.new(existing_holidays, &{holiday_key(&1), &1})
+
+          result =
+            Enum.reduce(
+              holidays,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_holiday, acc ->
+                attrs = extract_holiday_attrs(raw_holiday)
+                key = holiday_key(attrs)
+
+                if is_nil(key) do
+                  %{acc | failed: [%{item: raw_holiday, error: "missing holiday key fields"} | acc.failed]}
+                else
+                  case Map.get(existing_by_key, key) do
+                    nil ->
+                      case Ash.create(Holiday, attrs,
+                             action: :create,
+                             domain: Projects,
+                             authorize?: false
+                           ) do
+                        {:ok, _created} ->
+                          %{acc | created: [entry_from_key(key) | acc.created]}
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                entry_from_key(key)
+                                |> Map.put(:error, inspect(error))
+                                | acc.failed
+                              ]
+                          }
+                      end
+
+                    existing ->
+                      changes = build_changes(existing, attrs)
+
+                      if map_size(changes) == 0 do
+                        %{acc | skipped: [entry_from_key(key) | acc.skipped]}
+                      else
+                        case existing
+                             |> Ash.Changeset.for_update(:sync_from_px, changes)
+                             |> Ash.update(authorize?: false) do
+                          {:ok, _updated} ->
+                            %{
+                              acc
+                              | updated: [
+                                  entry_from_key(key)
+                                  |> Map.put(:changes, presentable_changes(changes))
+                                  | acc.updated
+                                ]
+                            }
+
+                          {:error, error} ->
+                            %{
+                              acc
+                              | failed: [
+                                  entry_from_key(key)
+                                  |> Map.put(:error, inspect(error))
+                                  | acc.failed
+                                ]
+                            }
+                        end
+                      end
+                  end
+                end
+              end
+            )
+
+          incoming_keys =
+            holidays
+            |> Enum.map(&extract_holiday_attrs/1)
+            |> Enum.map(&holiday_key/1)
+            |> Enum.reject(&is_nil/1)
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_holidays, incoming_keys, result)
+
+          %{
+            total: length(holidays),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp soft_hide_missing(existing_holidays, incoming_keys, result) do
+          Enum.reduce(existing_holidays, result, fn holiday, acc ->
+            key = holiday_key(holiday)
+
+            cond do
+              MapSet.member?(incoming_keys, key) ->
+                acc
+
+              not is_nil(holiday.hidden_at) ->
+                acc
+
+              true ->
+                case holiday
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [entry_from_key(key) | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [
+                          entry_from_key(key)
+                          |> Map.put(:error, inspect(error))
+                          | acc.failed
+                        ]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp extract_holiday_attrs(raw) do
+          %{
+            calendar_code: normalize_string(map_get(raw, :calendar_code)),
+            date: parse_date(map_get(raw, :date)),
+            holiday_code: normalize_string(map_get(raw, :holiday_code)),
+            name: normalize_string(map_get(raw, :name))
+          }
+          |> drop_nil_values()
+        end
+
+        defp build_changes(existing, attrs) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([:calendar_code, :date, :holiday_code])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp holiday_key(attrs) when is_map(attrs) do
+          calendar_code = Map.get(attrs, :calendar_code)
+          date = Map.get(attrs, :date)
+          holiday_code = Map.get(attrs, :holiday_code)
+
+          if is_binary(calendar_code) and match?(%Date{}, date) and is_binary(holiday_code) do
+            {calendar_code, date, holiday_code}
+          else
+            nil
+          end
+        end
+
+        defp entry_from_key({calendar_code, date, holiday_code}) do
+          %{
+            calendar_code: calendar_code,
+            date: Date.to_iso8601(date),
+            holiday_code: holiday_code
+          }
+        end
+
+        defp empty_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp map_get(map, key) when is_map(map) do
+          Map.get(map, key) || Map.get(map, Atom.to_string(key))
+        end
+
+        defp map_get(_, _), do: nil
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(value), do: inspect(value)
+
+        defp parse_date(nil), do: nil
+        defp parse_date(%Date{} = date), do: date
+
+        defp parse_date(value) when is_binary(value) do
+          value
+          |> String.trim()
+          |> case do
+            "" ->
+              nil
+
+            trimmed ->
+              case Date.from_iso8601(trimmed) do
+                {:ok, date} ->
+                  date
+
+                {:error, _} ->
+                  case DateTime.from_iso8601(trimmed) do
+                    {:ok, datetime, _offset} ->
+                      DateTime.to_date(datetime)
+
+                    {:error, _} ->
+                      case NaiveDateTime.from_iso8601(trimmed) do
+                        {:ok, naive_datetime} -> NaiveDateTime.to_date(naive_datetime)
+                        {:error, _} -> nil
+                      end
+                  end
+              end
+          end
+        end
+
+        defp parse_date(_), do: nil
 
         defp normalize_string(nil), do: nil
 

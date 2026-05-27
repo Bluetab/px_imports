@@ -17,11 +17,18 @@ defmodule PxImports do
     * `--spend-types` — generates `Projects.SpendType` and
       `SyncSpendTypesWorker` (daily Oban job).
 
+    * `--hour-types` — generates `Projects.HourType` and
+      `SyncHourTypesWorker` (daily Oban job from SAP SOAP `GetTiposHoras`).
+
     * `--month_close` — generates `Projects.MonthEndClose` and
       `SyncMonthEndCloseWorker` (daily Oban job).
 
     * `--positions` — generates `Projects.Position`,
       `Projects.PositionRelationship`, and `SyncPositionsWorker` (daily Oban job).
+
+    * `--holidays` — generates `Projects.Holiday` and `SyncHolidaysWorker`
+      (daily Oban job), flattening SuccessFactors holiday calendars into
+      rows keyed by calendar code + date + holiday code.
 
     * `--users` — patches the existing `Accounts.User` resource for PX employees
       (`sap_id`, `join_date`, `hidden_at`, `category`, `category_name` from PX as
@@ -35,12 +42,13 @@ defmodule PxImports do
   ## What is always generated
 
   Regardless of the flags chosen, the installer always sets up an Oban job
-  admin interface:
+  admin interface (Bluetab Design System / `bds` components — requires `bds` from
+  `bluetab_phoenix` or an equivalent setup):
 
     * `<App>.Jobs` context module (wraps Ecto queries on `oban_jobs`)
-    * `<App>Web.AdminLive` dashboard page
-    * `<App>Web.Admin.JobsLive` scheduled + recent jobs list
-    * `<App>Web.Admin.JobShowLive` detailed job inspection view
+    * `<App>Web.AdminLive` dashboard page (`bt-card`, `bt_example_grid`)
+    * `<App>Web.Admin.JobsLive` scheduled + recent jobs list (`bt_table`, `bt_button`)
+    * `<App>Web.Admin.JobShowLive` detailed job inspection view (`bt_card`, `bt_expansion`)
     * Router entries for `/admin`, `/admin/jobs`, `/admin/jobs/:id`
     * Dev-mode `oban_dashboard("/oban")` route
     * Oban config block in `config/config.exs` (idempotent)
