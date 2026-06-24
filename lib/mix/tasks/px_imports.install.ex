@@ -660,7 +660,7 @@ if Code.ensure_loaded?(Igniter) do
               String.contains?(content, "#{otp_app_str}, Oban") and
                   String.contains?(content, "Oban.Plugins.Cron") ->
                 Regex.replace(
-                  ~r/\{Oban\.Plugins\.Cron,\s*.*?\}/s,
+                  ~r/\{Oban\.Plugins\.Cron,\s*crontab:\s*\[.*?\]\s*\}/s,
                   content,
                   new_cron_plugin,
                   global: false
