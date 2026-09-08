@@ -4,7 +4,7 @@ defmodule PxImports.MixProject do
   def project do
     [
       app: :px_imports,
-      version: "26.6.24",
+      version: "26.9.8",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps()
