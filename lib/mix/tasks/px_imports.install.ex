@@ -1681,12 +1681,58 @@ if Code.ensure_loaded?(Igniter) do
       if String.contains?(content, route_line) do
         content
       else
-        Regex.replace(
-          ~r/(^\s*sign_out_route AuthController[^\n]*\n)/m,
-          content,
-          fn match -> match <> "    " <> route_line <> "\n" end,
-          global: false
-        )
+        lines = String.split(content, "\n")
+
+        case Enum.find_index(lines, &String.match?(&1, ~r/^\s*sign_out_route\b/)) do
+          nil ->
+            content
+
+          start_idx ->
+            end_idx = sign_out_route_end_index(lines, start_idx)
+            indent = leading_whitespace(Enum.at(lines, start_idx))
+            {before, after_} = Enum.split(lines, end_idx + 1)
+            Enum.join(before ++ [indent <> route_line] ++ after_, "\n")
+        end
+      end
+    end
+
+    # `sign_out_route` is often multi-line (trailing comma + overrides:). Insert after the
+    # full call, not after the first line — otherwise we nest routes into the call args.
+    defp sign_out_route_end_index(lines, start_idx) do
+      base_indent = indent_width(Enum.at(lines, start_idx))
+      last = length(lines) - 1
+
+      if start_idx >= last do
+        start_idx
+      else
+        Enum.reduce_while((start_idx + 1)..last, start_idx, fn i, acc ->
+          line = Enum.at(lines, i)
+
+          cond do
+            String.trim(line) == "" ->
+              {:halt, acc}
+
+            indent_width(line) > base_indent ->
+              {:cont, i}
+
+            true ->
+              {:halt, acc}
+          end
+        end)
+      end
+    end
+
+    defp indent_width(line) do
+      case Regex.run(~r/^([ \t]*)/, line) do
+        [_, ws] -> String.length(ws)
+        _ -> 0
+      end
+    end
+
+    defp leading_whitespace(line) do
+      case Regex.run(~r/^([ \t]*)/, line) do
+        [_, ws] -> ws
+        _ -> "    "
       end
     end
 
