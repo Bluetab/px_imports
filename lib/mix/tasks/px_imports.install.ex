@@ -48,6 +48,10 @@ if Code.ensure_loaded?(Igniter) do
         plus `SyncHolidaysWorker` (daily at 02:58), flattening SuccessFactors
         holiday calendars into holiday rows with `calendar_code`.
 
+      * `--employee-absences` — generates `<App>.Projects.EmployeeAbsence`
+        Ash resource plus `SyncEmployeeAbsencesWorker` (daily at 02:59)
+        from `BluetabConnect.Px.Rest.list_employee_absences/1`.
+
       * `--users` — patches `Accounts.User` with PX employee fields (see generated
         resource), `:provision_from_employee_sync`, `:sync_employee_fields`,
         `:list_for_admin`, `:set_admin`, and `SyncEmployeesWorker` (daily at 02:00).
@@ -71,6 +75,7 @@ if Code.ensure_loaded?(Igniter) do
         mix px_imports.install --month_close
         mix px_imports.install --positions
         mix px_imports.install --holidays
+        mix px_imports.install --employee-absences
         mix px_imports.install --org-tree --users
     """
 
@@ -88,7 +93,8 @@ if Code.ensure_loaded?(Igniter) do
           hour_types: :boolean,
           month_close: :boolean,
           positions: :boolean,
-          holidays: :boolean
+          holidays: :boolean,
+          employee_absences: :boolean
         ]
       }
     end
@@ -103,11 +109,13 @@ if Code.ensure_loaded?(Igniter) do
       install_month_close? = Keyword.get(opts, :month_close, false)
       install_positions? = Keyword.get(opts, :positions, false)
       install_holidays? = Keyword.get(opts, :holidays, false)
+      install_employee_absences? = Keyword.get(opts, :employee_absences, false)
 
       if not (install_org_tree? or install_users? or install_spend_types? or install_hour_types? or
-                install_month_close? or install_positions? or install_holidays?) do
+                install_month_close? or install_positions? or install_holidays? or
+                install_employee_absences?) do
         Igniter.add_issue(igniter, """
-        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, or --holidays must be specified.
+        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, --holidays, or --employee-absences must be specified.
 
         Examples:
           mix px_imports.install --org-tree
@@ -117,6 +125,7 @@ if Code.ensure_loaded?(Igniter) do
           mix px_imports.install --month_close
           mix px_imports.install --positions
           mix px_imports.install --holidays
+          mix px_imports.install --employee-absences
           mix px_imports.install --org-tree --users
         """)
       else
@@ -150,6 +159,9 @@ if Code.ensure_loaded?(Igniter) do
         sync_hour_types_worker_module = Module.concat([prefix, Workers, SyncHourTypesWorker])
         sync_positions_worker_module = Module.concat([prefix, Workers, SyncPositionsWorker])
         sync_holidays_worker_module = Module.concat([prefix, Workers, SyncHolidaysWorker])
+
+        sync_employee_absences_worker_module =
+          Module.concat([prefix, Workers, SyncEmployeeAbsencesWorker])
 
         sync_month_end_close_worker_module =
           Module.concat([prefix, Workers, SyncMonthEndCloseWorker])
@@ -189,6 +201,11 @@ if Code.ensure_loaded?(Igniter) do
           |> then(fn e ->
             if install_holidays?,
               do: e ++ [{"58 2 * * *", sync_holidays_worker_module}],
+              else: e
+          end)
+          |> then(fn e ->
+            if install_employee_absences?,
+              do: e ++ [{"59 2 * * *", sync_employee_absences_worker_module}],
               else: e
           end)
 
@@ -238,13 +255,18 @@ if Code.ensure_loaded?(Igniter) do
               do: resources ++ [Module.concat([prefix, Projects, Holiday])],
               else: resources
           end)
+          |> then(fn resources ->
+            if install_employee_absences?,
+              do: resources ++ [Module.concat([prefix, Projects, EmployeeAbsence])],
+              else: resources
+          end)
 
         all_project_resources = org_tree_resources ++ project_resources
 
         domains_to_add =
           if install_org_tree? or install_spend_types? or install_hour_types? or
                install_month_close? or
-               install_positions? or install_holidays?,
+               install_positions? or install_holidays? or install_employee_absences?,
              do: [projects_domain_module],
              else: []
 
@@ -491,6 +513,35 @@ if Code.ensure_loaded?(Igniter) do
             ign
           end
         end)
+        |> then(fn ign ->
+          if install_employee_absences? do
+            employee_absence_module = Module.concat([prefix, Projects, EmployeeAbsence])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_spend_types? or install_hour_types? or
+                   install_month_close? or
+                   install_positions? or install_holidays? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, employee_absence_module)
+            |> create_employee_absence_resource(
+              employee_absence_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_employee_absences_worker(
+              sync_employee_absences_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
         |> Igniter.add_notice("""
         PxImports has been configured!
 
@@ -537,6 +588,10 @@ if Code.ensure_loaded?(Igniter) do
         11. To install holidays sync only:
 
              mix px_imports.install --holidays
+
+        12. To install employee absences sync only:
+
+             mix px_imports.install --employee-absences
         """)
       end
     end
@@ -637,34 +692,29 @@ if Code.ensure_loaded?(Igniter) do
 
           merged_cron_entries =
             content
-            |> extract_existing_cron_entries()
-            |> merge_cron_entries(cron_entries)
+            |> PxImports.ObanCron.extract_entries()
+            |> PxImports.ObanCron.merge_entries(cron_entries)
 
-          crontab_lines =
-            merged_cron_entries
-            |> Enum.map(fn {cron, worker} ->
-              ~s|       {"#{cron}", #{worker}}|
-            end)
-            |> Enum.join(",\n")
-
-          new_cron_plugin = """
-          {Oban.Plugins.Cron,
-               crontab: [
-          #{crontab_lines}
-               ]}\
-          """
+          crontab_lines = PxImports.ObanCron.format_crontab_lines(merged_cron_entries)
+          new_cron_plugin = PxImports.ObanCron.format_plugin(merged_cron_entries)
 
           new_content =
             cond do
-              # Oban block exists with an empty or non-empty Cron plugin — replace it
+              # Oban block exists with a Cron plugin — replace empty `[]` or crontab list
               String.contains?(content, "#{otp_app_str}, Oban") and
                   String.contains?(content, "Oban.Plugins.Cron") ->
-                Regex.replace(
-                  ~r/\{Oban\.Plugins\.Cron,\s*crontab:\s*\[.*?\]\s*\}/s,
-                  content,
-                  new_cron_plugin,
-                  global: false
-                )
+                case PxImports.ObanCron.replace_plugin(content, new_cron_plugin) do
+                  :no_match ->
+                    String.replace(
+                      content,
+                      "plugins: [",
+                      "plugins: [\n    #{new_cron_plugin},",
+                      global: false
+                    )
+
+                  replaced ->
+                    replaced
+                end
 
               # Oban block exists but no Cron plugin at all — inject into plugins list
               String.contains?(content, "#{otp_app_str}, Oban") ->
@@ -700,33 +750,6 @@ if Code.ensure_loaded?(Igniter) do
           Rewrite.Source.update(source, :content, new_content)
         end
       end)
-    end
-
-    defp extract_existing_cron_entries(content) do
-      case Regex.run(
-             ~r/\{Oban\.Plugins\.Cron,\s*.*?crontab:\s*\[(.*?)\]\s*\}/s,
-             content,
-             capture: :all_but_first
-           ) do
-        [entries_block] ->
-          Regex.scan(~r/\{"([^"]+)",\s*([^\}]+)\}/, entries_block)
-          |> Enum.map(fn [_, cron, worker] -> {cron, String.trim(worker)} end)
-
-        _ ->
-          []
-      end
-    end
-
-    defp merge_cron_entries(existing_entries, new_entries) do
-      new_entries_as_strings =
-        Enum.map(new_entries, fn {cron, worker} -> {cron, inspect(worker)} end)
-
-      (existing_entries ++ new_entries_as_strings)
-      |> Enum.reduce(%{}, fn {cron, worker}, acc ->
-        Map.put(acc, worker, cron)
-      end)
-      |> Enum.map(fn {worker, cron} -> {cron, worker} end)
-      |> Enum.sort_by(fn {_cron, worker} -> worker end)
     end
 
     # ──────────────────────────────────────────────
@@ -924,15 +947,17 @@ if Code.ensure_loaded?(Igniter) do
                       open <>
                         """
 
-                        <Layouts.app
-                          flash={@flash}
-                          current_user={@current_user}
-                          current_path={assigns[:current_path] || "/"}
-                          impersonator={assigns[:impersonator]}
-                        >
-                    """ <> render_body <> """
-                        </Layouts.app>
-                    """ <> close
+                            <Layouts.app
+                              flash={@flash}
+                              current_user={@current_user}
+                              current_path={assigns[:current_path] || "/"}
+                              impersonator={assigns[:impersonator]}
+                            >
+                        """ <>
+                        render_body <>
+                        """
+                            </Layouts.app>
+                        """ <> close
                     end,
                     global: false
                   )
@@ -960,26 +985,26 @@ if Code.ensure_loaded?(Igniter) do
       else
         nav_card_fn = """
 
-      attr :navigate, :string, required: true
-      attr :icon, :string, required: true
-      attr :title, :string, required: true
-      attr :description, :string, required: true
+          attr :navigate, :string, required: true
+          attr :icon, :string, required: true
+          attr :title, :string, required: true
+          attr :description, :string, required: true
 
-      defp admin_nav_card(assigns) do
-        ~H\"\"\"
-        <.link
-          navigate={@navigate}
-          class="bt-card bt-card--elevated bt-card--half"
-          style="text-decoration: none; color: inherit; transition: box-shadow var(--bt-duration-base) var(--bt-ease);"
-        >
-          <h3 class="bt-section__title">
-            <.icon name={@icon} class="size-5" /> {@title}
-          </h3>
-          <p class="bt-section__description" style="margin-bottom: 0;">{@description}</p>
-        </.link>
-        \"\"\"
-      end
-    """
+          defp admin_nav_card(assigns) do
+            ~H\"\"\"
+            <.link
+              navigate={@navigate}
+              class="bt-card bt-card--elevated bt-card--half"
+              style="text-decoration: none; color: inherit; transition: box-shadow var(--bt-duration-base) var(--bt-ease);"
+            >
+              <h3 class="bt-section__title">
+                <.icon name={@icon} class="size-5" /> {@title}
+              </h3>
+              <p class="bt-section__description" style="margin-bottom: 0;">{@description}</p>
+            </.link>
+            \"\"\"
+          end
+        """
 
         append_before_module_end(content, nav_card_fn)
       end
@@ -4074,6 +4099,488 @@ if Code.ensure_loaded?(Igniter) do
 
         defp format_change_value(value) when is_binary(value), do: value
         defp format_change_value(value), do: inspect(value)
+
+        defp parse_date(nil), do: nil
+        defp parse_date(%Date{} = date), do: date
+
+        defp parse_date(value) when is_binary(value) do
+          value
+          |> String.trim()
+          |> case do
+            "" ->
+              nil
+
+            trimmed ->
+              case Date.from_iso8601(trimmed) do
+                {:ok, date} ->
+                  date
+
+                {:error, _} ->
+                  case DateTime.from_iso8601(trimmed) do
+                    {:ok, datetime, _offset} ->
+                      DateTime.to_date(datetime)
+
+                    {:error, _} ->
+                      case NaiveDateTime.from_iso8601(trimmed) do
+                        {:ok, naive_datetime} -> NaiveDateTime.to_date(naive_datetime)
+                        {:error, _} -> nil
+                      end
+                  end
+              end
+          end
+        end
+
+        defp parse_date(_), do: nil
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
+    # Employee absences: EmployeeAbsence + SyncEmployeeAbsencesWorker
+    # ──────────────────────────────────────────────
+
+    defp create_employee_absence_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "employee_absences"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+
+            accept [
+              :external_code,
+              :employee_number,
+              :ssff_user_id,
+              :time_type_code,
+              :time_type_name_en,
+              :time_type_name_es,
+              :start_date,
+              :end_date,
+              :quantity_in_days,
+              :quantity_in_hours,
+              :approval_status,
+              :hidden_at
+            ]
+          end
+
+          update :sync_from_px do
+            accept [
+              :employee_number,
+              :ssff_user_id,
+              :time_type_code,
+              :time_type_name_en,
+              :time_type_name_es,
+              :start_date,
+              :end_date,
+              :quantity_in_days,
+              :quantity_in_hours,
+              :approval_status,
+              :hidden_at
+            ]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          uuid_primary_key :id
+
+          attribute :external_code, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :employee_number, :integer do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :ssff_user_id, :string do
+            public? true
+          end
+
+          attribute :time_type_code, :string do
+            public? true
+          end
+
+          attribute :time_type_name_en, :string do
+            public? true
+          end
+
+          attribute :time_type_name_es, :string do
+            public? true
+          end
+
+          attribute :start_date, :date do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :end_date, :date do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :quantity_in_days, :float do
+            public? true
+          end
+
+          attribute :quantity_in_hours, :float do
+            public? true
+          end
+
+          attribute :approval_status, :string do
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+
+        identities do
+          identity :unique_external_code, [:external_code]
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_employee_absences_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        employee_absence_module = Module.concat(domain_module, EmployeeAbsence)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes PX employee absences into the local Projects.EmployeeAbsence resource.
+
+        Source: `BluetabConnect.Px.Rest.list_employee_absences/1`.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(employee_absence_module)}, as: EmployeeAbsence
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs a list of employee absences into the local employee_absences table.
+        \"\"\"
+        def execute(absences) when is_list(absences) do
+          sync_employee_absences(absences)
+        end
+
+        defp run_sync do
+          case BluetabConnect.Px.Rest.list_employee_absences() do
+            {:ok, %{"absences" => absences, "total" => _total}} when is_list(absences) ->
+              {:ok, execute(absences)}
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp sync_employee_absences(absences) do
+          existing_absences = Ash.read!(EmployeeAbsence, domain: Projects, authorize?: false)
+          existing_by_key = Map.new(existing_absences, &{&1.external_code, &1})
+
+          result =
+            Enum.reduce(
+              absences,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_absence, acc ->
+                attrs = extract_absence_attrs(raw_absence)
+                key = Map.get(attrs, :external_code)
+
+                if is_nil(key) do
+                  %{acc | failed: [%{item: raw_absence, error: "missing external_code"} | acc.failed]}
+                else
+                  case Map.get(existing_by_key, key) do
+                    nil ->
+                      case Ash.create(EmployeeAbsence, attrs,
+                             action: :create,
+                             domain: Projects,
+                             authorize?: false
+                           ) do
+                        {:ok, _created} ->
+                          %{acc | created: [entry_from_attrs(attrs) | acc.created]}
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                entry_from_attrs(attrs)
+                                |> Map.put(:error, inspect(error))
+                                | acc.failed
+                              ]
+                          }
+                      end
+
+                    existing ->
+                      changes = build_changes(existing, attrs)
+
+                      if map_size(changes) == 0 do
+                        %{acc | skipped: [entry_from_attrs(attrs) | acc.skipped]}
+                      else
+                        case existing
+                             |> Ash.Changeset.for_update(:sync_from_px, changes)
+                             |> Ash.update(authorize?: false) do
+                          {:ok, _updated} ->
+                            %{
+                              acc
+                              | updated: [
+                                  entry_from_attrs(attrs)
+                                  |> Map.put(:changes, presentable_changes(changes))
+                                  | acc.updated
+                                ]
+                            }
+
+                          {:error, error} ->
+                            %{
+                              acc
+                              | failed: [
+                                  entry_from_attrs(attrs)
+                                  |> Map.put(:error, inspect(error))
+                                  | acc.failed
+                                ]
+                            }
+                        end
+                      end
+                  end
+                end
+              end
+            )
+
+          incoming_keys =
+            absences
+            |> Enum.map(&extract_absence_attrs/1)
+            |> Enum.map(&Map.get(&1, :external_code))
+            |> Enum.reject(&is_nil/1)
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_absences, incoming_keys, result)
+
+          %{
+            total: length(absences),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp soft_hide_missing(existing_absences, incoming_keys, result) do
+          Enum.reduce(existing_absences, result, fn absence, acc ->
+            key = absence.external_code
+
+            cond do
+              MapSet.member?(incoming_keys, key) ->
+                acc
+
+              not is_nil(absence.hidden_at) ->
+                acc
+
+              true ->
+                case absence
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [entry_from_attrs(absence) | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [
+                          entry_from_attrs(absence)
+                          |> Map.put(:error, inspect(error))
+                          | acc.failed
+                        ]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp extract_absence_attrs(raw) do
+          %{
+            external_code: normalize_string(map_get(raw, :external_code)),
+            employee_number: parse_integer(map_get(raw, :employee_number)),
+            ssff_user_id: normalize_string(map_get(raw, :ssff_user_id)),
+            time_type_code: normalize_string(map_get(raw, :time_type_code)),
+            time_type_name_en: normalize_string(map_get(raw, :time_type_name_en)),
+            time_type_name_es: normalize_string(map_get(raw, :time_type_name_es)),
+            start_date: parse_date(map_get(raw, :start_date)),
+            end_date: parse_date(map_get(raw, :end_date)),
+            quantity_in_days: parse_float(map_get(raw, :quantity_in_days)),
+            quantity_in_hours: parse_float(map_get(raw, :quantity_in_hours)),
+            approval_status: normalize_string(map_get(raw, :approval_status))
+          }
+          |> drop_nil_values()
+        end
+
+        defp build_changes(existing, attrs) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([:external_code])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp entry_from_attrs(attrs) when is_map(attrs) do
+          start_date =
+            case map_get(attrs, :start_date) do
+              %Date{} = date -> Date.to_iso8601(date)
+              other -> other
+            end
+
+          %{
+            external_code: map_get(attrs, :external_code),
+            employee_number: map_get(attrs, :employee_number),
+            start_date: start_date
+          }
+        end
+
+        defp empty_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp map_get(map, key) when is_map(map) and is_atom(key) do
+          Map.get(map, key) || Map.get(map, Atom.to_string(key))
+        end
+
+        defp map_get(_, _), do: nil
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(%Date{} = value), do: Date.to_iso8601(value)
+        defp format_change_value(value), do: inspect(value)
+
+        defp parse_integer(nil), do: nil
+        defp parse_integer(value) when is_integer(value), do: value
+
+        defp parse_integer(value) when is_binary(value) do
+          case Integer.parse(value) do
+            {number, ""} -> number
+            _ -> nil
+          end
+        end
+
+        defp parse_integer(_), do: nil
+
+        defp parse_float(nil), do: nil
+        defp parse_float(value) when is_float(value), do: value
+        defp parse_float(value) when is_integer(value), do: value * 1.0
+
+        defp parse_float(value) when is_binary(value) do
+          case Float.parse(value) do
+            {number, ""} -> number
+            _ -> nil
+          end
+        end
+
+        defp parse_float(_), do: nil
 
         defp parse_date(nil), do: nil
         defp parse_date(%Date{} = date), do: date

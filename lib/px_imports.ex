@@ -30,6 +30,10 @@ defmodule PxImports do
       (daily Oban job), flattening SuccessFactors holiday calendars into
       rows keyed by calendar code + date + holiday code.
 
+    * `--employee-absences` — generates `Projects.EmployeeAbsence` and
+      `SyncEmployeeAbsencesWorker` (daily Oban job) from the PX Employee
+      Absences API (`BluetabConnect.Px.Rest.list_employee_absences/1`).
+
     * `--users` — patches the existing `Accounts.User` resource for PX employees
       (`sap_id`, `join_date`, `hidden_at`, `category`, `category_name` from PX as
       strings), `:provision_from_employee_sync` and `:sync_employee_fields`, plus
