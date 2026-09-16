@@ -4721,6 +4721,7 @@ if Code.ensure_loaded?(Igniter) do
               :email,
               :start_date,
               :duration_days,
+              :status,
               :hidden_at
             ]
           end
@@ -4728,6 +4729,7 @@ if Code.ensure_loaded?(Igniter) do
           update :sync_from_px do
             accept [
               :duration_days,
+              :status,
               :hidden_at
             ]
           end
@@ -4754,6 +4756,10 @@ if Code.ensure_loaded?(Igniter) do
 
           attribute :duration_days, :integer do
             allow_nil? false
+            public? true
+          end
+
+          attribute :status, :string do
             public? true
           end
 
@@ -4971,7 +4977,8 @@ if Code.ensure_loaded?(Igniter) do
           %{
             email: normalize_string(map_get(raw, :email)),
             start_date: parse_date(map_get(raw, :start_date)),
-            duration_days: parse_integer(map_get(raw, :duration_days))
+            duration_days: parse_integer(map_get(raw, :duration_days)),
+            status: normalize_string(map_get(raw, :status))
           }
           |> drop_nil_values()
         end
@@ -5012,7 +5019,8 @@ if Code.ensure_loaded?(Igniter) do
           %{
             email: map_get(attrs, :email),
             start_date: start_date,
-            duration_days: map_get(attrs, :duration_days)
+            duration_days: map_get(attrs, :duration_days),
+            status: map_get(attrs, :status)
           }
         end
 
