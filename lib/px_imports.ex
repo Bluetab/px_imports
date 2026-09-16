@@ -34,6 +34,10 @@ defmodule PxImports do
       `SyncEmployeeAbsencesWorker` (daily Oban job) from the PX Employee
       Absences API (`BluetabConnect.Px.Rest.list_employee_absences/1`).
 
+    * `--per-diems` — generates `Projects.EmployeePerDiem` and
+      `SyncEmployeePerDiemsWorker` (daily Oban job) from the Spend
+      Employee Per-Diems API (`BluetabConnect.Spend.Rest.list_employee_per_diems/1`).
+
     * `--users` — patches the existing `Accounts.User` resource for PX employees
       (`sap_id`, `join_date`, `hidden_at`, `category`, `category_name` from PX as
       strings), `:provision_from_employee_sync` and `:sync_employee_fields`, plus

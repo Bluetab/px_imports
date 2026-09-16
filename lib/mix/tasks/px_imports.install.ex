@@ -52,6 +52,10 @@ if Code.ensure_loaded?(Igniter) do
         Ash resource plus `SyncEmployeeAbsencesWorker` (daily at 02:59)
         from `BluetabConnect.Px.Rest.list_employee_absences/1`.
 
+      * `--per-diems` — generates `<App>.Projects.EmployeePerDiem`
+        Ash resource plus `SyncEmployeePerDiemsWorker` (daily at 03:01)
+        from `BluetabConnect.Spend.Rest.list_employee_per_diems/1`.
+
       * `--users` — patches `Accounts.User` with PX employee fields (see generated
         resource), `:provision_from_employee_sync`, `:sync_employee_fields`,
         `:list_for_admin`, `:set_admin`, and `SyncEmployeesWorker` (daily at 02:00).
@@ -76,6 +80,7 @@ if Code.ensure_loaded?(Igniter) do
         mix px_imports.install --positions
         mix px_imports.install --holidays
         mix px_imports.install --employee-absences
+        mix px_imports.install --per-diems
         mix px_imports.install --org-tree --users
     """
 
@@ -94,7 +99,8 @@ if Code.ensure_loaded?(Igniter) do
           month_close: :boolean,
           positions: :boolean,
           holidays: :boolean,
-          employee_absences: :boolean
+          employee_absences: :boolean,
+          per_diems: :boolean
         ]
       }
     end
@@ -110,12 +116,13 @@ if Code.ensure_loaded?(Igniter) do
       install_positions? = Keyword.get(opts, :positions, false)
       install_holidays? = Keyword.get(opts, :holidays, false)
       install_employee_absences? = Keyword.get(opts, :employee_absences, false)
+      install_per_diems? = Keyword.get(opts, :per_diems, false)
 
       if not (install_org_tree? or install_users? or install_spend_types? or install_hour_types? or
                 install_month_close? or install_positions? or install_holidays? or
-                install_employee_absences?) do
+                install_employee_absences? or install_per_diems?) do
         Igniter.add_issue(igniter, """
-        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, --holidays, or --employee-absences must be specified.
+        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, --holidays, --employee-absences, or --per-diems must be specified.
 
         Examples:
           mix px_imports.install --org-tree
@@ -126,6 +133,7 @@ if Code.ensure_loaded?(Igniter) do
           mix px_imports.install --positions
           mix px_imports.install --holidays
           mix px_imports.install --employee-absences
+          mix px_imports.install --per-diems
           mix px_imports.install --org-tree --users
         """)
       else
@@ -162,6 +170,9 @@ if Code.ensure_loaded?(Igniter) do
 
         sync_employee_absences_worker_module =
           Module.concat([prefix, Workers, SyncEmployeeAbsencesWorker])
+
+        sync_employee_per_diems_worker_module =
+          Module.concat([prefix, Workers, SyncEmployeePerDiemsWorker])
 
         sync_month_end_close_worker_module =
           Module.concat([prefix, Workers, SyncMonthEndCloseWorker])
@@ -206,6 +217,11 @@ if Code.ensure_loaded?(Igniter) do
           |> then(fn e ->
             if install_employee_absences?,
               do: e ++ [{"59 2 * * *", sync_employee_absences_worker_module}],
+              else: e
+          end)
+          |> then(fn e ->
+            if install_per_diems?,
+              do: e ++ [{"1 3 * * *", sync_employee_per_diems_worker_module}],
               else: e
           end)
 
@@ -260,13 +276,19 @@ if Code.ensure_loaded?(Igniter) do
               do: resources ++ [Module.concat([prefix, Projects, EmployeeAbsence])],
               else: resources
           end)
+          |> then(fn resources ->
+            if install_per_diems?,
+              do: resources ++ [Module.concat([prefix, Projects, EmployeePerDiem])],
+              else: resources
+          end)
 
         all_project_resources = org_tree_resources ++ project_resources
 
         domains_to_add =
           if install_org_tree? or install_spend_types? or install_hour_types? or
                install_month_close? or
-               install_positions? or install_holidays? or install_employee_absences?,
+               install_positions? or install_holidays? or install_employee_absences? or
+               install_per_diems?,
              do: [projects_domain_module],
              else: []
 
@@ -542,6 +564,35 @@ if Code.ensure_loaded?(Igniter) do
             ign
           end
         end)
+        |> then(fn ign ->
+          if install_per_diems? do
+            employee_per_diem_module = Module.concat([prefix, Projects, EmployeePerDiem])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_spend_types? or install_hour_types? or
+                   install_month_close? or
+                   install_positions? or install_holidays? or install_employee_absences? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, employee_per_diem_module)
+            |> create_employee_per_diem_resource(
+              employee_per_diem_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_employee_per_diems_worker(
+              sync_employee_per_diems_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
         |> Igniter.add_notice("""
         PxImports has been configured!
 
@@ -559,6 +610,11 @@ if Code.ensure_loaded?(Igniter) do
 
              PX_BASE_URL=https://your-px-instance.example.com
              PX_BEARER_TOKEN=your-bearer-token
+
+           For --per-diems (Spend API):
+
+             SPEND_API_URL=https://spend.app.bluetab.net
+             SPEND_API_KEY=your-spend-api-key
 
         4. The Oban dev dashboard is available at /oban (dev mode only).
 
@@ -592,6 +648,10 @@ if Code.ensure_loaded?(Igniter) do
         12. To install employee absences sync only:
 
              mix px_imports.install --employee-absences
+
+        13. To install employee per-diems sync only:
+
+             mix px_imports.install --per-diems
         """)
       end
     end
@@ -4581,6 +4641,431 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp parse_float(_), do: nil
+
+        defp parse_date(nil), do: nil
+        defp parse_date(%Date{} = date), do: date
+
+        defp parse_date(value) when is_binary(value) do
+          value
+          |> String.trim()
+          |> case do
+            "" ->
+              nil
+
+            trimmed ->
+              case Date.from_iso8601(trimmed) do
+                {:ok, date} ->
+                  date
+
+                {:error, _} ->
+                  case DateTime.from_iso8601(trimmed) do
+                    {:ok, datetime, _offset} ->
+                      DateTime.to_date(datetime)
+
+                    {:error, _} ->
+                      case NaiveDateTime.from_iso8601(trimmed) do
+                        {:ok, naive_datetime} -> NaiveDateTime.to_date(naive_datetime)
+                        {:error, _} -> nil
+                      end
+                  end
+              end
+          end
+        end
+
+        defp parse_date(_), do: nil
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
+    # Employee per-diems: EmployeePerDiem + SyncEmployeePerDiemsWorker
+    # ──────────────────────────────────────────────
+
+    defp create_employee_per_diem_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "employee_per_diems"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+
+            accept [
+              :email,
+              :start_date,
+              :duration_days,
+              :hidden_at
+            ]
+          end
+
+          update :sync_from_px do
+            accept [
+              :duration_days,
+              :hidden_at
+            ]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          uuid_primary_key :id
+
+          attribute :email, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :start_date, :date do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :duration_days, :integer do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+
+        identities do
+          identity :unique_email_start_date, [:email, :start_date]
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_employee_per_diems_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        employee_per_diem_module = Module.concat(domain_module, EmployeePerDiem)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes Spend employee per-diems into the local Projects.EmployeePerDiem resource.
+
+        Source: `BluetabConnect.Spend.Rest.list_employee_per_diems/1`.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(employee_per_diem_module)}, as: EmployeePerDiem
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs a list of employee per-diems into the local employee_per_diems table.
+        \"\"\"
+        def execute(per_diems) when is_list(per_diems) do
+          sync_employee_per_diems(per_diems)
+        end
+
+        defp run_sync do
+          case BluetabConnect.Spend.Rest.list_employee_per_diems() do
+            {:ok, per_diems} when is_list(per_diems) ->
+              {:ok, execute(per_diems)}
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp sync_employee_per_diems(per_diems) do
+          existing_per_diems = Ash.read!(EmployeePerDiem, domain: Projects, authorize?: false)
+          existing_by_key = Map.new(existing_per_diems, &{per_diem_key(&1), &1})
+
+          result =
+            Enum.reduce(
+              per_diems,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_per_diem, acc ->
+                attrs = extract_per_diem_attrs(raw_per_diem)
+                key = per_diem_key(attrs)
+
+                if is_nil(key) do
+                  %{acc | failed: [%{item: raw_per_diem, error: "missing email or start_date"} | acc.failed]}
+                else
+                  case Map.get(existing_by_key, key) do
+                    nil ->
+                      case Ash.create(EmployeePerDiem, attrs,
+                             action: :create,
+                             domain: Projects,
+                             authorize?: false
+                           ) do
+                        {:ok, _created} ->
+                          %{acc | created: [entry_from_attrs(attrs) | acc.created]}
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                entry_from_attrs(attrs)
+                                |> Map.put(:error, inspect(error))
+                                | acc.failed
+                              ]
+                          }
+                      end
+
+                    existing ->
+                      changes = build_changes(existing, attrs)
+
+                      if map_size(changes) == 0 do
+                        %{acc | skipped: [entry_from_attrs(attrs) | acc.skipped]}
+                      else
+                        case existing
+                             |> Ash.Changeset.for_update(:sync_from_px, changes)
+                             |> Ash.update(authorize?: false) do
+                          {:ok, _updated} ->
+                            %{
+                              acc
+                              | updated: [
+                                  entry_from_attrs(attrs)
+                                  |> Map.put(:changes, presentable_changes(changes))
+                                  | acc.updated
+                                ]
+                            }
+
+                          {:error, error} ->
+                            %{
+                              acc
+                              | failed: [
+                                  entry_from_attrs(attrs)
+                                  |> Map.put(:error, inspect(error))
+                                  | acc.failed
+                                ]
+                            }
+                        end
+                      end
+                  end
+                end
+              end
+            )
+
+          incoming_keys =
+            per_diems
+            |> Enum.map(&extract_per_diem_attrs/1)
+            |> Enum.map(&per_diem_key/1)
+            |> Enum.reject(&is_nil/1)
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_per_diems, incoming_keys, result)
+
+          %{
+            total: length(per_diems),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp soft_hide_missing(existing_per_diems, incoming_keys, result) do
+          Enum.reduce(existing_per_diems, result, fn per_diem, acc ->
+            key = per_diem_key(per_diem)
+
+            cond do
+              MapSet.member?(incoming_keys, key) ->
+                acc
+
+              not is_nil(per_diem.hidden_at) ->
+                acc
+
+              true ->
+                case per_diem
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [entry_from_attrs(per_diem) | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [
+                          entry_from_attrs(per_diem)
+                          |> Map.put(:error, inspect(error))
+                          | acc.failed
+                        ]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp extract_per_diem_attrs(raw) do
+          %{
+            email: normalize_string(map_get(raw, :email)),
+            start_date: parse_date(map_get(raw, :start_date)),
+            duration_days: parse_integer(map_get(raw, :duration_days))
+          }
+          |> drop_nil_values()
+        end
+
+        defp per_diem_key(attrs) when is_map(attrs) do
+          email = map_get(attrs, :email)
+          start_date = map_get(attrs, :start_date)
+
+          if is_nil(email) or is_nil(start_date) do
+            nil
+          else
+            {email, start_date}
+          end
+        end
+
+        defp per_diem_key(_), do: nil
+
+        defp build_changes(existing, attrs) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([:email, :start_date])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp entry_from_attrs(attrs) when is_map(attrs) do
+          start_date =
+            case map_get(attrs, :start_date) do
+              %Date{} = date -> Date.to_iso8601(date)
+              other -> other
+            end
+
+          %{
+            email: map_get(attrs, :email),
+            start_date: start_date,
+            duration_days: map_get(attrs, :duration_days)
+          }
+        end
+
+        defp empty_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp map_get(map, key) when is_map(map) and is_atom(key) do
+          Map.get(map, key) || Map.get(map, Atom.to_string(key))
+        end
+
+        defp map_get(_, _), do: nil
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(%Date{} = value), do: Date.to_iso8601(value)
+        defp format_change_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+        defp format_change_value(value), do: inspect(value)
+
+        defp parse_integer(nil), do: nil
+        defp parse_integer(value) when is_integer(value), do: value
+
+        defp parse_integer(value) when is_binary(value) do
+          case Integer.parse(value) do
+            {number, ""} -> number
+            _ -> nil
+          end
+        end
+
+        defp parse_integer(_), do: nil
 
         defp parse_date(nil), do: nil
         defp parse_date(%Date{} = date), do: date
