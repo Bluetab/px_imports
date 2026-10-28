@@ -38,6 +38,11 @@ defmodule PxImports do
       `SyncEmployeePerDiemsWorker` (daily Oban job) from the Spend
       Employee Per-Diems API (`BluetabConnect.Spend.Rest.list_employee_per_diems/1`).
 
+    * `--planned-hours` — generates `Projects.PlannedHour` and
+      `SyncPlannedHoursWorker` (daily Oban job) from the PX Planned Hours API
+      (`BluetabConnect.Px.Rest.list_planned_hours/1`), keyed by employee number,
+      project `doc_num` and month.
+
     * `--users` — patches the existing `Accounts.User` resource for PX employees
       (`sap_id`, `join_date`, `hidden_at`, `category`, `category_name` from PX as
       strings), `:provision_from_employee_sync` and `:sync_employee_fields`, plus

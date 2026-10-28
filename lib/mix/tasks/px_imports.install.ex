@@ -56,6 +56,12 @@ if Code.ensure_loaded?(Igniter) do
         Ash resource plus `SyncEmployeePerDiemsWorker` (daily at 03:01)
         from `BluetabConnect.Spend.Rest.list_employee_per_diems/1`.
 
+      * `--planned-hours` — generates `<App>.Projects.PlannedHour`
+        Ash resource plus `SyncPlannedHoursWorker` (daily at 03:02)
+        from `BluetabConnect.Px.Rest.list_planned_hours/1`. Rows are keyed by
+        employee number + project `doc_num` + month (`YYYY-MM`). Requires
+        `bluetab_connect` 26.10.28 or later.
+
       * `--users` — patches `Accounts.User` with PX employee fields (see generated
         resource), `:provision_from_employee_sync`, `:sync_employee_fields`,
         `:list_for_admin`, `:set_admin`, and `SyncEmployeesWorker` (daily at 02:00).
@@ -81,6 +87,7 @@ if Code.ensure_loaded?(Igniter) do
         mix px_imports.install --holidays
         mix px_imports.install --employee-absences
         mix px_imports.install --per-diems
+        mix px_imports.install --planned-hours
         mix px_imports.install --org-tree --users
     """
 
@@ -100,7 +107,8 @@ if Code.ensure_loaded?(Igniter) do
           positions: :boolean,
           holidays: :boolean,
           employee_absences: :boolean,
-          per_diems: :boolean
+          per_diems: :boolean,
+          planned_hours: :boolean
         ]
       }
     end
@@ -117,12 +125,13 @@ if Code.ensure_loaded?(Igniter) do
       install_holidays? = Keyword.get(opts, :holidays, false)
       install_employee_absences? = Keyword.get(opts, :employee_absences, false)
       install_per_diems? = Keyword.get(opts, :per_diems, false)
+      install_planned_hours? = Keyword.get(opts, :planned_hours, false)
 
       if not (install_org_tree? or install_users? or install_spend_types? or install_hour_types? or
                 install_month_close? or install_positions? or install_holidays? or
-                install_employee_absences? or install_per_diems?) do
+                install_employee_absences? or install_per_diems? or install_planned_hours?) do
         Igniter.add_issue(igniter, """
-        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, --holidays, --employee-absences, or --per-diems must be specified.
+        At least one of --org-tree, --users, --spend-types, --hour-types, --month_close, --positions, --holidays, --employee-absences, --per-diems, or --planned-hours must be specified.
 
         Examples:
           mix px_imports.install --org-tree
@@ -134,6 +143,7 @@ if Code.ensure_loaded?(Igniter) do
           mix px_imports.install --holidays
           mix px_imports.install --employee-absences
           mix px_imports.install --per-diems
+          mix px_imports.install --planned-hours
           mix px_imports.install --org-tree --users
         """)
       else
@@ -173,6 +183,9 @@ if Code.ensure_loaded?(Igniter) do
 
         sync_employee_per_diems_worker_module =
           Module.concat([prefix, Workers, SyncEmployeePerDiemsWorker])
+
+        sync_planned_hours_worker_module =
+          Module.concat([prefix, Workers, SyncPlannedHoursWorker])
 
         sync_month_end_close_worker_module =
           Module.concat([prefix, Workers, SyncMonthEndCloseWorker])
@@ -222,6 +235,11 @@ if Code.ensure_loaded?(Igniter) do
           |> then(fn e ->
             if install_per_diems?,
               do: e ++ [{"1 3 * * *", sync_employee_per_diems_worker_module}],
+              else: e
+          end)
+          |> then(fn e ->
+            if install_planned_hours?,
+              do: e ++ [{"2 3 * * *", sync_planned_hours_worker_module}],
               else: e
           end)
 
@@ -281,6 +299,11 @@ if Code.ensure_loaded?(Igniter) do
               do: resources ++ [Module.concat([prefix, Projects, EmployeePerDiem])],
               else: resources
           end)
+          |> then(fn resources ->
+            if install_planned_hours?,
+              do: resources ++ [Module.concat([prefix, Projects, PlannedHour])],
+              else: resources
+          end)
 
         all_project_resources = org_tree_resources ++ project_resources
 
@@ -288,7 +311,7 @@ if Code.ensure_loaded?(Igniter) do
           if install_org_tree? or install_spend_types? or install_hour_types? or
                install_month_close? or
                install_positions? or install_holidays? or install_employee_absences? or
-               install_per_diems?,
+               install_per_diems? or install_planned_hours?,
              do: [projects_domain_module],
              else: []
 
@@ -593,6 +616,36 @@ if Code.ensure_loaded?(Igniter) do
             ign
           end
         end)
+        |> then(fn ign ->
+          if install_planned_hours? do
+            planned_hour_module = Module.concat([prefix, Projects, PlannedHour])
+
+            ign
+            |> then(fn i ->
+              if install_org_tree? or install_spend_types? or install_hour_types? or
+                   install_month_close? or
+                   install_positions? or install_holidays? or install_employee_absences? or
+                   install_per_diems? do
+                i
+              else
+                create_projects_domain(i, projects_domain_module, all_project_resources, otp_app)
+              end
+            end)
+            |> ensure_resource_in_domain(projects_domain_module, planned_hour_module)
+            |> create_planned_hour_resource(
+              planned_hour_module,
+              projects_domain_module,
+              repo_module
+            )
+            |> create_sync_planned_hours_worker(
+              sync_planned_hours_worker_module,
+              projects_domain_module,
+              prefix
+            )
+          else
+            ign
+          end
+        end)
         |> Igniter.add_notice("""
         PxImports has been configured!
 
@@ -615,6 +668,9 @@ if Code.ensure_loaded?(Igniter) do
 
              SPEND_API_URL=https://spend.app.bluetab.net
              SPEND_API_KEY=your-spend-api-key
+
+           --planned-hours uses the PX token above (service account, admin, or
+           business operations) and needs bluetab_connect 26.10.28 or later.
 
         4. The Oban dev dashboard is available at /oban (dev mode only).
 
@@ -652,6 +708,10 @@ if Code.ensure_loaded?(Igniter) do
         13. To install employee per-diems sync only:
 
              mix px_imports.install --per-diems
+
+        14. To install planned hours sync only:
+
+             mix px_imports.install --planned-hours
         """)
       end
     end
@@ -1897,12 +1957,14 @@ if Code.ensure_loaded?(Igniter) do
         else
           resource_line = "    resource #{resource_str}"
 
+          # The block closes at the `end` indented like `resources do`; a lazy `^\s*end`
+          # would stop at the `end` of a nested `resource X do ... end` (code interface).
           new_source =
             Regex.replace(
-              ~r/(resources\s+do\n)(.*?)(^\s*end)/ms,
+              ~r/^([ \t]*)(resources\s+do\n)(.*?)(^\1end\b)/ms,
               source,
-              fn _, opener, existing, closer ->
-                opener <> existing <> resource_line <> "\n" <> closer
+              fn _, indent, opener, existing, closer ->
+                indent <> opener <> existing <> resource_line <> "\n" <> closer
               end,
               global: false
             )
@@ -5106,6 +5168,430 @@ if Code.ensure_loaded?(Igniter) do
         end
 
         defp parse_date(_), do: nil
+
+        defp normalize_string(nil), do: nil
+
+        defp normalize_string(value) when is_binary(value) do
+          case String.trim(value) do
+            "" -> nil
+            trimmed -> trimmed
+          end
+        end
+
+        defp normalize_string(value), do: to_string(value)
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    # ──────────────────────────────────────────────
+    # Planned hours: PlannedHour + SyncPlannedHoursWorker
+    # ──────────────────────────────────────────────
+
+    defp create_planned_hour_resource(igniter, module, domain_module, repo_module) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        contents = """
+        use Ash.Resource,
+          domain: #{inspect(domain_module)},
+          data_layer: AshPostgres.DataLayer,
+          authorizers: [Ash.Policy.Authorizer]
+
+        postgres do
+          table "planned_hours"
+          repo #{inspect(repo_module)}
+        end
+
+        actions do
+          defaults [:read]
+
+          create :create do
+            primary? true
+
+            accept [
+              :employee_number,
+              :doc_num,
+              :project_name,
+              :month,
+              :hours,
+              :hidden_at
+            ]
+          end
+
+          update :sync_from_px do
+            accept [
+              :project_name,
+              :hours,
+              :hidden_at
+            ]
+          end
+        end
+
+        policies do
+          bypass always() do
+            authorize_if always()
+          end
+        end
+
+        attributes do
+          uuid_primary_key :id
+
+          attribute :employee_number, :integer do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :doc_num, :integer do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :project_name, :string do
+            public? true
+          end
+
+          # PX month, as sent by the API: "YYYY-MM"
+          attribute :month, :string do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :hours, :float do
+            allow_nil? false
+            public? true
+          end
+
+          attribute :hidden_at, :utc_datetime do
+            public? true
+          end
+        end
+
+        identities do
+          identity :unique_employee_doc_num_month, [:employee_number, :doc_num, :month]
+        end
+        """
+
+        Igniter.Project.Module.create_module(igniter, module, contents)
+      end
+    end
+
+    defp create_sync_planned_hours_worker(igniter, module, domain_module, prefix) do
+      {exists?, igniter} = Igniter.Project.Module.module_exists(igniter, module)
+
+      if exists? do
+        igniter
+      else
+        repo_module = Module.concat(prefix, Repo)
+        planned_hour_module = Module.concat(domain_module, PlannedHour)
+
+        contents = """
+        @moduledoc \"\"\"
+        Synchronizes PX planned hours into the local Projects.PlannedHour resource.
+
+        Source: `BluetabConnect.Px.Rest.list_planned_hours/1`, called without filters:
+        the soft-hide step needs the complete set to know which rows PX stopped returning.
+        \"\"\"
+
+        use Oban.Worker, queue: :default, max_attempts: 3
+
+        alias #{inspect(domain_module)}
+        alias #{inspect(planned_hour_module)}, as: PlannedHour
+        alias #{inspect(repo_module)}
+
+        @impl Oban.Worker
+        def perform(job) do
+          case run_sync() do
+            {:ok, summary} ->
+              details = Map.put(summary, :completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              job
+              |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+              |> Repo.update!()
+
+              :ok
+
+            {:error, reason, summary} ->
+              details =
+                summary
+                |> Map.put(:error, inspect(reason))
+                |> Map.put(:completed_at, DateTime.utc_now() |> DateTime.to_iso8601())
+
+              _ =
+                job
+                |> Ecto.Changeset.change(%{meta: Map.merge(job.meta, details)})
+                |> Repo.update()
+
+              {:error, reason}
+          end
+        end
+
+        @doc \"\"\"
+        Syncs a list of planned hours into the local planned_hours table.
+        \"\"\"
+        def execute(planned_hours) when is_list(planned_hours) do
+          sync_planned_hours(planned_hours)
+        end
+
+        defp run_sync do
+          case BluetabConnect.Px.Rest.list_planned_hours() do
+            {:ok, %{"planned_hours" => planned_hours, "total" => _total}}
+            when is_list(planned_hours) ->
+              {:ok, execute(planned_hours)}
+
+            {:ok, _unexpected_payload} ->
+              {:error, :invalid_payload, empty_result()}
+
+            {:error, reason} ->
+              {:error, reason, empty_result()}
+          end
+        end
+
+        defp sync_planned_hours(planned_hours) do
+          existing_planned_hours = Ash.read!(PlannedHour, domain: Projects, authorize?: false)
+          existing_by_key = Map.new(existing_planned_hours, &{planned_hour_key(&1), &1})
+
+          result =
+            Enum.reduce(
+              planned_hours,
+              %{created: [], updated: [], skipped: [], hidden: [], failed: []},
+              fn raw_planned_hour, acc ->
+                attrs = extract_planned_hour_attrs(raw_planned_hour)
+                key = planned_hour_key(attrs)
+
+                if is_nil(key) do
+                  %{
+                    acc
+                    | failed: [
+                        %{item: raw_planned_hour, error: "missing employee_number, doc_num or month"}
+                        | acc.failed
+                      ]
+                  }
+                else
+                  case Map.get(existing_by_key, key) do
+                    nil ->
+                      case Ash.create(PlannedHour, attrs,
+                             action: :create,
+                             domain: Projects,
+                             authorize?: false
+                           ) do
+                        {:ok, _created} ->
+                          %{acc | created: [entry_from_attrs(attrs) | acc.created]}
+
+                        {:error, error} ->
+                          %{
+                            acc
+                            | failed: [
+                                entry_from_attrs(attrs)
+                                |> Map.put(:error, inspect(error))
+                                | acc.failed
+                              ]
+                          }
+                      end
+
+                    existing ->
+                      changes = build_changes(existing, attrs)
+
+                      if map_size(changes) == 0 do
+                        %{acc | skipped: [entry_from_attrs(attrs) | acc.skipped]}
+                      else
+                        case existing
+                             |> Ash.Changeset.for_update(:sync_from_px, changes)
+                             |> Ash.update(authorize?: false) do
+                          {:ok, _updated} ->
+                            %{
+                              acc
+                              | updated: [
+                                  entry_from_attrs(attrs)
+                                  |> Map.put(:changes, presentable_changes(changes))
+                                  | acc.updated
+                                ]
+                            }
+
+                          {:error, error} ->
+                            %{
+                              acc
+                              | failed: [
+                                  entry_from_attrs(attrs)
+                                  |> Map.put(:error, inspect(error))
+                                  | acc.failed
+                                ]
+                            }
+                        end
+                      end
+                  end
+                end
+              end
+            )
+
+          incoming_keys =
+            planned_hours
+            |> Enum.map(&extract_planned_hour_attrs/1)
+            |> Enum.map(&planned_hour_key/1)
+            |> Enum.reject(&is_nil/1)
+            |> MapSet.new()
+
+          hidden_result = soft_hide_missing(existing_planned_hours, incoming_keys, result)
+
+          %{
+            total: length(planned_hours),
+            created_count: length(hidden_result.created),
+            updated_count: length(hidden_result.updated),
+            skipped_count: length(hidden_result.skipped),
+            hidden_count: length(hidden_result.hidden),
+            failed_count: length(hidden_result.failed),
+            created: Enum.reverse(hidden_result.created),
+            updated: Enum.reverse(hidden_result.updated),
+            skipped: Enum.reverse(hidden_result.skipped),
+            hidden: Enum.reverse(hidden_result.hidden),
+            failed: Enum.reverse(hidden_result.failed)
+          }
+        end
+
+        defp soft_hide_missing(existing_planned_hours, incoming_keys, result) do
+          Enum.reduce(existing_planned_hours, result, fn planned_hour, acc ->
+            key = planned_hour_key(planned_hour)
+
+            cond do
+              MapSet.member?(incoming_keys, key) ->
+                acc
+
+              not is_nil(planned_hour.hidden_at) ->
+                acc
+
+              true ->
+                case planned_hour
+                     |> Ash.Changeset.for_update(:sync_from_px, %{hidden_at: DateTime.utc_now()})
+                     |> Ash.update(authorize?: false) do
+                  {:ok, _hidden} ->
+                    %{acc | hidden: [entry_from_attrs(planned_hour) | acc.hidden]}
+
+                  {:error, error} ->
+                    %{
+                      acc
+                      | failed: [
+                          entry_from_attrs(planned_hour)
+                          |> Map.put(:error, inspect(error))
+                          | acc.failed
+                        ]
+                    }
+                end
+            end
+          end)
+        end
+
+        defp extract_planned_hour_attrs(raw) do
+          %{
+            employee_number: parse_integer(map_get(raw, :employee_number)),
+            doc_num: parse_integer(map_get(raw, :doc_num)),
+            project_name: normalize_string(map_get(raw, :project_name)),
+            month: normalize_string(map_get(raw, :month)),
+            hours: parse_float(map_get(raw, :hours))
+          }
+          |> drop_nil_values()
+        end
+
+        defp planned_hour_key(attrs) when is_map(attrs) do
+          employee_number = map_get(attrs, :employee_number)
+          doc_num = map_get(attrs, :doc_num)
+          month = map_get(attrs, :month)
+
+          if is_nil(employee_number) or is_nil(doc_num) or is_nil(month) do
+            nil
+          else
+            {employee_number, doc_num, month}
+          end
+        end
+
+        defp planned_hour_key(_), do: nil
+
+        defp build_changes(existing, attrs) do
+          attrs
+          |> Map.put_new(:hidden_at, nil)
+          |> Map.drop([:employee_number, :doc_num, :month])
+          |> Enum.reduce(%{}, fn {key, value}, changes ->
+            if Map.get(existing, key) != value do
+              Map.put(changes, key, value)
+            else
+              changes
+            end
+          end)
+        end
+
+        defp entry_from_attrs(attrs) when is_map(attrs) do
+          %{
+            employee_number: map_get(attrs, :employee_number),
+            doc_num: map_get(attrs, :doc_num),
+            month: map_get(attrs, :month),
+            hours: map_get(attrs, :hours)
+          }
+        end
+
+        defp empty_result do
+          %{
+            total: 0,
+            created_count: 0,
+            updated_count: 0,
+            skipped_count: 0,
+            hidden_count: 0,
+            failed_count: 0,
+            created: [],
+            updated: [],
+            skipped: [],
+            hidden: [],
+            failed: []
+          }
+        end
+
+        defp map_get(map, key) when is_map(map) and is_atom(key) do
+          Map.get(map, key) || Map.get(map, Atom.to_string(key))
+        end
+
+        defp map_get(_, _), do: nil
+
+        defp drop_nil_values(map) do
+          map
+          |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+          |> Map.new()
+        end
+
+        defp presentable_changes(changes) do
+          Enum.map(changes, fn {field, value} ->
+            %{field: to_string(field), new_value: format_change_value(value)}
+          end)
+        end
+
+        defp format_change_value(value) when is_binary(value), do: value
+        defp format_change_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+        defp format_change_value(value), do: inspect(value)
+
+        defp parse_integer(nil), do: nil
+        defp parse_integer(value) when is_integer(value), do: value
+
+        defp parse_integer(value) when is_binary(value) do
+          case Integer.parse(value) do
+            {number, ""} -> number
+            _ -> nil
+          end
+        end
+
+        defp parse_integer(_), do: nil
+
+        defp parse_float(nil), do: nil
+        defp parse_float(value) when is_float(value), do: value
+        defp parse_float(value) when is_integer(value), do: value * 1.0
+
+        defp parse_float(value) when is_binary(value) do
+          case Float.parse(value) do
+            {number, ""} -> number
+            _ -> nil
+          end
+        end
+
+        defp parse_float(_), do: nil
 
         defp normalize_string(nil), do: nil
 
